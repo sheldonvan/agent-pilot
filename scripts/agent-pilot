@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: agent-pilot <agent-id> <command> [args...]" >&2
+  exit 2
+fi
+
+AGENT_ID="$1"
+shift
+
+COLLECTOR_URL="${PILOT_COLLECTOR_URL:-http://127.0.0.1:8787}"
+AGENT_KIND="${PILOT_AGENT_KIND:-unknown}"
+AGENT_NAME="${PILOT_AGENT_NAME:-$AGENT_ID}"
+TMUX_SESSION="${PILOT_TMUX_SESSION:-${AGENT_ID//[^a-zA-Z0-9_]/_}}"
+
+post_event() {
+  local status="$1"
+  local output="${2:-}"
+  curl -sS -X POST "$COLLECTOR_URL/api/events" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"agentId\": \"$AGENT_ID\",
+      \"name\": \"$AGENT_NAME\",
+      \"kind\": \"$AGENT_KIND\",
+      \"location\": \"local\",
+      \"machineLabel\": \"Local Mac\",
+      \"cwd\": \"$PWD\",
+      \"status\": \"$status\",
+      \"currentTask\": \"Wrapper managed session\",
+      \"lastOutput\": \"$output\",
+      \"tmuxSession\": \"$TMUX_SESSION\"
+    }" >/dev/null || true
+}
+
+post_event "running" "starting: $*"
+
+set +e
+"$@"
+exit_code="$?"
+set -e
+
+if [ "$exit_code" -eq 0 ]; then
+  post_event "done" "command finished"
+else
+  post_event "error" "command exited with $exit_code"
+fi
+
+exit "$exit_code"

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Pilot</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="window-header" data-tauri-drag-region>
+        <div class="window-title" aria-label="Agent Pilot">Agent Pilot</div>
+        <section class="summary-grid" aria-label="状态统计">
+          <article class="summary-card">
+            <span class="summary-dot green"></span>
+            <span class="summary-label">在线</span>
+            <strong id="runningCount">0</strong>
+          </article>
+          <article class="summary-card">
+            <span class="summary-dot amber"></span>
+            <span class="summary-label">需关注</span>
+            <strong id="attentionCount">0</strong>
+          </article>
+          <article class="summary-card refresh-card">
+            <span class="summary-dot blue"></span>
+            <span class="summary-label">自刷新</span>
+            <button class="summary-refresh" id="refreshBtn" title="立即刷新检测" aria-label="立即刷新检测">立即刷新</button>
+          </article>
+        </section>
+        <div class="actions">
+          <button class="icon-button glass-button" id="settingsBtn" title="设置" aria-label="设置">⚙</button>
+          <button class="icon-button glass-button" id="addBtn" title="手动添加 Agent" aria-label="手动添加 Agent">＋</button>
+        </div>
+      </section>
+
+      <section class="agent-list" id="agentList" aria-label="Agent 列表"></section>
+
+      <footer class="footer">
+        <span id="lastUpdated">尚未同步</span>
+        <span class="footer-brand"><span class="dot online"></span>Pilot v0.1.0</span>
+      </footer>
+    </main>
+
+    <dialog id="candidateDialog" class="dialog">
+      <form method="dialog" class="dialog-panel">
+        <header>
+          <div>
+            <p class="eyebrow">Discovery</p>
+            <h2>检测到的新 Agent</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="关闭">x</button>
+        </header>
+        <div id="candidateList" class="stack"></div>
+      </form>
+    </dialog>
+
+    <dialog id="manualDialog" class="dialog">
+      <form method="dialog" class="dialog-panel form-panel" id="manualForm">
+        <header>
+          <div>
+            <p class="eyebrow">Manual</p>
+            <h2>手动添加 Agent</h2>
+          </div>
+          <button class="icon-button" id="closeManualBtn" type="button" aria-label="关闭">x</button>
+        </header>
+
+        <label>
+          Agent 名称
+          <input name="name" required placeholder="Remote Codex · 项目A" />
+        </label>
+
+        <div class="field-row">
+          <label>
+            类型
+            <select name="kind">
+              <option value="codex">Codex CLI</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label>
+            位置
+            <select name="location" id="locationSelect">
+              <option value="local">本地</option>
+              <option value="remote">远程</option>
+            </select>
+          </label>
+        </div>
+
+        <label>
+          项目路径
+          <input name="cwd" placeholder="~/Desktop/project" />
+        </label>
+
+        <label>
+          当前任务
+          <input name="currentTask" placeholder="实现 Agent Discovery MVP" />
+        </label>
+
+        <div class="field-row">
+          <label>
+            终端
+            <select name="terminalApp">
+              <option value="ghostty">Ghostty</option>
+              <option value="terminal">Terminal.app</option>
+              <option value="iterm">iTerm2</option>
+            </select>
+          </label>
+          <label>
+            tmux session
+            <input name="sessionName" required placeholder="codex_project_a" />
+          </label>
+        </div>
+
+        <div class="field-row remote-fields">
+          <label>
+            SSH Host
+            <input name="sshHost" placeholder="your.server.com" />
+          </label>
+          <label>
+            SSH User
+            <input name="sshUser" placeholder="root" />
+          </label>
+        </div>
+
+        <div class="field-row remote-fields">
+          <label>
+            SSH Port
+            <input name="sshPort" type="number" min="1" value="22" />
+          </label>
+          <label>
+            机器名
+            <input name="machineLabel" placeholder="Linux Server" />
+          </label>
+        </div>
+
+        <menu>
+          <button class="primary" id="submitManualBtn" value="default">保存</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" class="dialog">
+      <form method="dialog" class="dialog-panel settings-panel">
+        <header>
+          <div>
+            <p class="eyebrow">Settings</p>
+            <h2>软件设置</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="关闭">x</button>
+        </header>
+
+        <section class="settings-section" aria-label="外观设置">
+          <div>
+            <h3>背景色</h3>
+            <p>选择窗口背景随系统变化，或固定为黑色 / 白色。</p>
+          </div>
+          <div class="theme-options" role="radiogroup" aria-label="背景色模式">
+            <label class="theme-option">
+              <input type="radio" name="themeMode" value="system" />
+              <span>随系统</span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="themeMode" value="dark" />
+              <span>黑色</span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="themeMode" value="light" />
+              <span>白色</span>
+            </label>
+          </div>
+        </section>
+      </form>
+    </dialog>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>

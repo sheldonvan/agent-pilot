@@ -1,0 +1,17 @@
+.DS_Store
+
+# Rust / Tauri build output
+src-tauri/target/
+target/
+
+# JavaScript dependencies / logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env files
+.env
+.env.*
+

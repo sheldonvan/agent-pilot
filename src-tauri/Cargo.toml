@@ -1,0 +1,30 @@
+[package]
+name = "agent-pilot"
+version = "0.1.0"
+description = "Agent Pilot"
+authors = ["Agent Pilot"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "=2.0.0", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = { version = "=3.7.0", default-features = false }
+tauri = { version = "=2.0.0", features = ["macos-private-api"] }
+tauri-codegen = { version = "=2.0.0", default-features = false }
+tauri-macros = { version = "=2.0.0", default-features = false }
+tauri-runtime = { version = "=2.0.0", default-features = false }
+tauri-runtime-wry = { version = "=2.0.0", default-features = false }
+tauri-utils = { version = "=2.0.0", default-features = false }
+idna = { version = "=1.0.3", default-features = false }
+idna_adapter = { version = "=1.0.0", default-features = false }
+indexmap = { version = "=2.2.6", default-features = false }
+time = { version = "=0.3.36", default-features = false }
+url = { version = "=2.5.4", default-features = false }
+uuid = { version = "=1.18.1", default-features = false }
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]

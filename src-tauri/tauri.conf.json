@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agent Pilot",
+  "version": "0.1.0",
+  "identifier": "com.agentpilot.desktop",
+  "build": {
+    "beforeDevCommand": "python3 -m http.server 5174 -d web",
+    "devUrl": "http://127.0.0.1:5174",
+    "frontendDist": "../web"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "",
+        "width": 430,
+        "height": 760,
+        "minWidth": 390,
+        "minHeight": 620,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "category": "DeveloperTool",
+    "shortDescription": "Agent Pilot management floating desk"
+  }
+}

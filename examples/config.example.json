@@ -1,0 +1,31 @@
+{
+  "app": {
+    "listenHost": "127.0.0.1",
+    "listenPort": 8787,
+    "offlineTimeoutSec": 120,
+    "defaultTerminal": "ghostty"
+  },
+  "discovery": {
+    "enabled": true,
+    "scanOnStartup": true,
+    "localScanIntervalSec": 60,
+    "remoteScanIntervalSec": 60,
+    "autoAddMode": "auto",
+    "scanLocalProcesses": true,
+    "scanLocalTmux": true,
+    "scanRemoteHosts": true,
+    "trustedCommands": ["claude", "codex"],
+    "ignoredFingerprints": []
+  },
+  "remoteHosts": [
+    {
+      "id": "server-main",
+      "label": "Linux Server",
+      "sshHost": "your.server.com",
+      "sshUser": "root",
+      "sshPort": 22,
+      "scanEnabled": true
+    }
+  ],
+  "agents": []
+}
