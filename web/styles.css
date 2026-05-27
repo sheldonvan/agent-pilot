@@ -698,12 +698,6 @@ h2 {
   border-color: rgba(255, 159, 10, 0.28);
 }
 
-.agent-status-banner.done {
-  color: #0a6ee0;
-  background: rgba(10, 132, 255, 0.12);
-  border-color: rgba(10, 132, 255, 0.2);
-}
-
 .agent-status-banner.error {
   color: #cf2e26;
   background: rgba(255, 69, 58, 0.12);

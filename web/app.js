@@ -634,7 +634,7 @@ function agentStateLine(agent) {
 }
 
 function agentStatusBanner(agent) {
-  if (!["waiting_attention", "done", "error"].includes(agent.status)) return "";
+  if (!["waiting_attention", "error"].includes(agent.status)) return "";
   return `<div class="agent-status-banner ${agent.status}">${escapeHtml(agentStateLine(agent))}</div>`;
 }
 
