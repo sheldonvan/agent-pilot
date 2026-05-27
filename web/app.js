@@ -33,7 +33,7 @@ const els = {
 let themeMode = localStorage.getItem(themeStorageKey) || "system";
 
 let state = {
-  version: "0.1.1",
+  version: "0.2.0",
   scanning: false,
   collectorOnline: false,
   collectorUrl: apiBase,
@@ -615,7 +615,7 @@ function statusName(status) {
   return {
     running: "运行中",
     waiting_attention: "需关注",
-    done: "已完成",
+    done: "等待输入",
     error: "错误",
     offline: "离线",
     unknown: "未知",
@@ -626,7 +626,7 @@ function agentStateLine(agent) {
   return {
     running: "最近扫描检测到 Agent 仍在运行",
     waiting_attention: "终端正在等待你的审批 / Yes / Enter",
-    done: "Agent 已结束或终端已回到空闲 shell",
+    done: "Agent 已完成，终端正在等待下一条指令",
     error: "Agent 上报了错误状态",
     offline: "进程已离线，等待自动清理",
     unknown: "等待下一次状态信号",

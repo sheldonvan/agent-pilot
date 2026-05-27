@@ -1,6 +1,6 @@
 [package]
 name = "agent-pilot"
-version = "0.1.1"
+version = "0.2.0"
 description = "Agent Pilot"
 authors = ["Agent Pilot"]
 edition = "2021"

@@ -288,7 +288,7 @@ const SCAN_DISCOVERY_SOURCES: [&str; 10] = [
     "vscode_remote_tmux",
 ];
 
-const APP_VERSION: &str = "0.1.1";
+const APP_VERSION: &str = "0.2.0";
 const VSCODE_REMOTE_EXEC_HELPER: &str = include_str!("../helpers/vscode_remote_exec.cjs");
 
 fn main() {
@@ -2714,6 +2714,8 @@ fn infer_status_from_terminal_text(
     let recent_text = excerpt.as_deref().unwrap_or(text);
     let status = if contains_attention_prompt(recent_text) {
         Some(AgentStatus::WaitingAttention)
+    } else if contains_waiting_input_prompt(recent_text) {
+        Some(AgentStatus::Done)
     } else if current_command.map(is_idle_shell_command).unwrap_or(false) {
         Some(AgentStatus::Done)
     } else {
@@ -2749,6 +2751,57 @@ fn contains_attention_prompt(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+}
+
+fn contains_waiting_input_prompt(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    if [
+        "new task? /clear",
+        "press enter to close",
+        "ready for input",
+        "waiting for input",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return true;
+    }
+
+    text.lines().rev().take(10).any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed == "›" || trimmed.starts_with("› ") {
+            return true;
+        }
+        if trimmed == "❯" || trimmed.ends_with(" ❯") {
+            return true;
+        }
+        let lowered = trimmed.to_lowercase();
+        lowered.ends_with(" new task?")
+            || lowered.contains("new task? /")
+            || looks_like_shell_prompt(trimmed)
+    })
+}
+
+fn looks_like_shell_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() > 120 || trimmed.contains('\t') {
+        return false;
+    }
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+    if !matches!(last, '$' | '%' | '#') {
+        return false;
+    }
+    trimmed.contains('@')
+        || trimmed.contains('~')
+        || trimmed.contains('/')
+        || trimmed.starts_with('$')
+        || trimmed.starts_with('%')
+        || trimmed.starts_with('#')
 }
 
 fn is_idle_shell_command(command: &str) -> bool {
@@ -4664,6 +4717,24 @@ mod tests {
             Some("Claude Code 等待处理：approve Bash".to_string())
         );
         assert_eq!(hint.cwd, Some("/tmp/project".to_string()));
+    }
+
+    #[test]
+    fn maps_terminal_new_task_prompt_to_done() {
+        let (status, _) = infer_status_from_terminal_text(
+            "✔ Create run.py\n❯\n⏵⏵ accept edits on · new task? /clear to save",
+            Some("claude"),
+        );
+
+        assert!(matches!(status, Some(AgentStatus::Done)));
+    }
+
+    #[test]
+    fn keeps_approval_prompt_as_attention_before_idle_prompt() {
+        let (status, _) =
+            infer_status_from_terminal_text("Do you want to proceed?\n› yes", Some("codex"));
+
+        assert!(matches!(status, Some(AgentStatus::WaitingAttention)));
     }
 
     #[test]

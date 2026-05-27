@@ -3,7 +3,7 @@
 更新时间：2026-05-23  
 项目路径：`/Users/van/MyFile/desktop ai`  
 当前产品名：`Agent Pilot`  
-当前版本：`0.1.1`
+当前版本：`0.2.0`
 当前 Git 分支：`main`  
 当前基础备份提交：`c34c241 Backup Agent Pilot initial version`
 
