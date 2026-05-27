@@ -3,6 +3,7 @@ const apiBase = "http://127.0.0.1:8787/api";
 const dragIgnoreSelector = "button,input,select,textarea,a,[role='button'],dialog";
 const autoRefreshIntervalMs = 60_000;
 const themeStorageKey = "agentPilot.themeMode";
+const permissionGuideStorageKey = "agentPilot.permissionGuide.v1";
 
 const els = {
   runningCount: document.querySelector("#runningCount"),
@@ -13,18 +14,26 @@ const els = {
   settingsBtn: document.querySelector("#settingsBtn"),
   addBtn: document.querySelector("#addBtn"),
   settingsDialog: document.querySelector("#settingsDialog"),
+  permissionDialog: document.querySelector("#permissionDialog"),
+  permissionGuideBtn: document.querySelector("#permissionGuideBtn"),
+  skipPermissionBtn: document.querySelector("#skipPermissionBtn"),
+  finishPermissionBtn: document.querySelector("#finishPermissionBtn"),
   candidateDialog: document.querySelector("#candidateDialog"),
   candidateList: document.querySelector("#candidateList"),
   manualDialog: document.querySelector("#manualDialog"),
   manualForm: document.querySelector("#manualForm"),
   closeManualBtn: document.querySelector("#closeManualBtn"),
+  sshPasswordDialog: document.querySelector("#sshPasswordDialog"),
+  sshPasswordForm: document.querySelector("#sshPasswordForm"),
+  closeSshPasswordBtn: document.querySelector("#closeSshPasswordBtn"),
+  sshPasswordTarget: document.querySelector("#sshPasswordTarget"),
   locationSelect: document.querySelector("#locationSelect"),
 };
 
 let themeMode = localStorage.getItem(themeStorageKey) || "system";
 
 let state = {
-  version: "0.1.0",
+  version: "0.1.1",
   scanning: false,
   collectorOnline: false,
   collectorUrl: apiBase,
@@ -76,6 +85,10 @@ let state = {
       discoveryState: "managed",
       discoverySources: ["manual"],
       confidence: 0.8,
+      sshHost: "your.server.com",
+      sshUser: "root",
+      sshPort: 22,
+      sshPasswordRequired: true,
       startedAt: new Date(Date.now() - 18 * 60 * 1000).toISOString(),
       updatedAt: new Date().toISOString(),
       durationSec: 18 * 60,
@@ -168,8 +181,10 @@ async function httpInvoke(command, args = {}) {
     ignore_candidate: ["POST", "/discovery/ignore", args],
     manual_agent: ["POST", "/agents/manual", { agent: args.agent }],
     rename_agent: ["POST", "/agents/rename", { id: args.id, name: args.name }],
+    save_ssh_password: ["POST", "/ssh/password", args],
     post_event: ["POST", "/events", args.event || args],
     open_terminal: ["POST", "/open-terminal", { target: args.target }],
+    open_permission_settings: ["POST", "/permissions/open", { pane: args.pane }],
   };
   const route = routes[command];
   if (!route) throw new Error(`No HTTP route for ${command}`);
@@ -217,8 +232,16 @@ async function mockInvoke(command, args) {
     state.agents = state.agents.map((agent) => (agent.id === args.id ? { ...agent, name } : agent));
     return { ok: true };
   }
+  if (command === "save_ssh_password") {
+    state.agents = state.agents.map((agent) =>
+      agent.sshHost === args.sshHost && Number(agent.sshPort || 22) === Number(args.sshPort || 22)
+        ? { ...agent, sshPasswordRequired: false, lastOutput: "SSH 密码已保存到本机配置。" }
+        : agent,
+    );
+    return { ok: true };
+  }
   if (command === "post_event") return { ok: true };
-  if (command === "open_terminal" || command === "open_config_file") return { ok: true };
+  if (command === "open_terminal" || command === "open_config_file" || command === "open_permission_settings") return { ok: true };
   return null;
 }
 
@@ -243,10 +266,12 @@ function agentFromCandidate(candidate, name) {
     tmuxPane: candidate.tmuxPane,
     sshHost: candidate.sshHost,
     sshUser: candidate.sshUser,
+    sshPort: candidate.sshPort,
+    sshPasswordRequired: Boolean(candidate.sshPasswordRequired),
     startedAt: candidate.detectedAt,
     updatedAt: new Date().toISOString(),
     durationSec: 0,
-    terminalTarget: buildTerminalTarget(candidate.location, "ghostty", candidate.cwd, session, candidate.sshHost, candidate.sshUser, 22),
+    terminalTarget: buildTerminalTarget(candidate.location, "ghostty", candidate.cwd, session, candidate.sshHost, candidate.sshUser, candidate.sshPort || 22),
   };
 }
 
@@ -305,6 +330,7 @@ function renderAgentCard(agent) {
               : `<h3>${escapeHtml(agent.name)}</h3>`
           }
           <button class="name-edit-button ${isEditingName ? "is-confirm" : ""}" data-name-action="${isEditingName ? "save" : "edit"}" title="${isEditingName ? "保存备注" : "修改备注"}" aria-label="${isEditingName ? "保存备注" : "修改备注"}">${isEditingName ? "✓" : "✎"}</button>
+          ${sshPasswordBadge(agent)}
         </div>
         <div class="agent-meta">${kindName(agent.kind)} · ${escapeHtml(agentContext(agent))}</div>
         <div class="agent-state-line ${agent.status}">${escapeHtml(agentStateLine(agent))}</div>
@@ -350,7 +376,7 @@ function renderAgentCard(agent) {
     }
   };
   summary.addEventListener("click", (event) => {
-    if (event.target.closest("[data-open], [data-name-action], .agent-name-input")) return;
+    if (event.target.closest("[data-open], [data-name-action], [data-ssh-password-agent], .agent-name-input")) return;
     toggleCard();
   });
   summary.addEventListener("keydown", (event) => {
@@ -368,6 +394,10 @@ function renderAgentCard(agent) {
     editingAgentId = agent.id;
     editingAgentName = agent.name;
     render();
+  });
+  card.querySelector("[data-ssh-password-agent]")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openSshPasswordDialog(agent);
   });
   const nameInput = card.querySelector(".agent-name-input");
   if (nameInput) {
@@ -395,6 +425,28 @@ function renderAgentCard(agent) {
     await invoke("open_terminal", { target: agent.terminalTarget });
   });
   return card;
+}
+
+function sshPasswordBadge(agent) {
+  if (!agent.sshPasswordRequired || !agent.sshHost) return "";
+  return `
+    <button class="ssh-password-badge" data-ssh-password-agent="${escapeHtml(agent.id)}" title="保存这个远程连接的 SSH 密码" aria-label="保存 SSH 密码">
+      需要 SSH 密码
+    </button>
+  `;
+}
+
+function openSshPasswordDialog(agent) {
+  if (!els.sshPasswordDialog || !els.sshPasswordForm) return;
+  const form = els.sshPasswordForm;
+  form.reset();
+  form.elements.sshHost.value = agent.sshHost || agent.terminalTarget?.sshHost || "";
+  form.elements.sshUser.value = agent.sshUser || agent.terminalTarget?.sshUser || "";
+  form.elements.sshPort.value = String(agent.sshPort || agent.terminalTarget?.sshPort || 22);
+  const userPrefix = form.elements.sshUser.value ? `${form.elements.sshUser.value}@` : "";
+  els.sshPasswordTarget.textContent = `${userPrefix}${form.elements.sshHost.value}:${form.elements.sshPort.value}`;
+  els.sshPasswordDialog.showModal();
+  setTimeout(() => form.elements.password?.focus(), 40);
 }
 
 function agentDetail(icon, label, value, tone = "") {
@@ -531,6 +583,8 @@ function readManualAgent(form) {
     tmuxSession: sessionName,
     sshHost: data.sshHost,
     sshUser: data.sshUser,
+    sshPort: Number(data.sshPort || 22),
+    sshPasswordRequired: false,
     updatedAt: new Date().toISOString(),
     durationSec: 0,
     terminalTarget,
@@ -594,10 +648,28 @@ function agentContext(agent) {
 }
 
 function openButtonText(agent) {
+  if (agent.terminalTarget?.terminalApp === "vscode") return "定位 VS Code";
   if (agent.terminalTarget?.type === "desktop-app") return "定位 Codex";
   if (agent.terminalTarget?.type === "local-process" && agent.terminalTarget?.tty) return "定位终端";
   if (agent.terminalTarget?.type === "local-process") return "查看进程";
+  if (agent.terminalTarget?.type === "ssh-process") return "查看远程进程";
   return "打开终端";
+}
+
+function showPermissionGuide({ force = false } = {}) {
+  if (!els.permissionDialog) return;
+  if (!force && localStorage.getItem(permissionGuideStorageKey) === "done") return;
+  if (els.permissionDialog.open) return;
+  els.permissionDialog.showModal();
+}
+
+function closePermissionGuide({ remember = true } = {}) {
+  if (remember) localStorage.setItem(permissionGuideStorageKey, "done");
+  els.permissionDialog?.close();
+}
+
+async function openPermissionPane(pane) {
+  await invoke("open_permission_settings", { pane });
 }
 
 function formatTime(value) {
@@ -624,6 +696,13 @@ els.refreshBtn.addEventListener("click", refreshDiscovery);
 els.settingsBtn.addEventListener("click", () => els.settingsDialog.showModal());
 els.addBtn.addEventListener("click", () => els.manualDialog.showModal());
 els.closeManualBtn.addEventListener("click", () => els.manualDialog.close());
+els.closeSshPasswordBtn?.addEventListener("click", () => els.sshPasswordDialog?.close());
+els.permissionGuideBtn?.addEventListener("click", () => showPermissionGuide({ force: true }));
+els.skipPermissionBtn?.addEventListener("click", () => closePermissionGuide());
+els.finishPermissionBtn?.addEventListener("click", () => closePermissionGuide());
+document.querySelectorAll("[data-permission-open]").forEach((button) => {
+  button.addEventListener("click", () => openPermissionPane(button.dataset.permissionOpen));
+});
 document.querySelectorAll("input[name='themeMode']").forEach((input) => {
   input.addEventListener("change", () => applyTheme(input.value));
 });
@@ -637,6 +716,20 @@ els.manualForm.addEventListener("submit", async (event) => {
   updateRemoteFields();
   await syncState();
 });
+els.sshPasswordForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(els.sshPasswordForm).entries());
+  const response = await invoke("save_ssh_password", {
+    sshHost: data.sshHost,
+    sshUser: data.sshUser || null,
+    sshPort: Number(data.sshPort || 22),
+    password: data.password,
+  });
+  if (!response?.ok) return;
+  els.sshPasswordDialog.close();
+  els.sshPasswordForm.reset();
+  await refreshDiscovery();
+});
 
 updateRemoteFields();
 applyTheme();
@@ -644,3 +737,4 @@ setupWindowDragging();
 render();
 syncState();
 startAutoRefresh();
+setTimeout(() => showPermissionGuide(), 500);

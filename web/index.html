@@ -37,9 +37,54 @@
 
       <footer class="footer">
         <span id="lastUpdated">尚未同步</span>
-        <span class="footer-brand"><span class="dot online"></span>Pilot v0.1.0</span>
+        <span class="footer-brand"><span class="dot online"></span>Pilot v0.1.1</span>
       </footer>
     </main>
+
+    <dialog id="permissionDialog" class="dialog">
+      <form method="dialog" class="dialog-panel permission-panel">
+        <header>
+          <div>
+            <p class="eyebrow">First Launch</p>
+            <h2>授权 Agent Pilot</h2>
+          </div>
+          <button class="icon-button" id="skipPermissionBtn" type="button" aria-label="关闭">x</button>
+        </header>
+
+        <div class="permission-stack">
+          <section class="permission-item">
+            <span class="permission-icon">⌘</span>
+            <div>
+              <h3>辅助功能</h3>
+              <p>允许 Agent Pilot 定位 Terminal、Ghostty、VS Code 窗口，并读取终端文本判断审批状态。</p>
+            </div>
+            <button type="button" class="permission-action" data-permission-open="accessibility">打开</button>
+          </section>
+
+          <section class="permission-item">
+            <span class="permission-icon">◎</span>
+            <div>
+              <h3>自动化</h3>
+              <p>macOS 首次弹出控制 System Events、Terminal、Ghostty、VS Code 的确认时，请选择允许。</p>
+            </div>
+            <button type="button" class="permission-action" data-permission-open="automation">打开</button>
+          </section>
+
+          <section class="permission-item">
+            <span class="permission-icon">◈</span>
+            <div>
+              <h3>完全磁盘访问</h3>
+              <p>如果状态读取不完整，可授予此项，让本地日志和会话文件读取更稳定。</p>
+            </div>
+            <button type="button" class="permission-action" data-permission-open="full_disk">打开</button>
+          </section>
+        </div>
+
+        <menu>
+          <button type="button" id="finishPermissionBtn" class="primary">完成</button>
+        </menu>
+      </form>
+    </dialog>
 
     <dialog id="candidateDialog" class="dialog">
       <form method="dialog" class="dialog-panel">
@@ -140,6 +185,35 @@
       </form>
     </dialog>
 
+    <dialog id="sshPasswordDialog" class="dialog">
+      <form method="dialog" class="dialog-panel form-panel" id="sshPasswordForm">
+        <header>
+          <div>
+            <p class="eyebrow">SSH Auth</p>
+            <h2>保存 SSH 密码</h2>
+          </div>
+          <button class="icon-button" id="closeSshPasswordBtn" type="button" aria-label="关闭">x</button>
+        </header>
+
+        <p class="dialog-note" id="sshPasswordTarget">需要密码的远程连接</p>
+
+        <input type="hidden" name="sshHost" />
+        <input type="hidden" name="sshUser" />
+        <input type="hidden" name="sshPort" />
+
+        <label>
+          SSH 密码
+          <input name="password" type="password" autocomplete="current-password" required placeholder="输入后保存到本机" />
+        </label>
+
+        <p class="dialog-note">密码会保存在本机 Agent Pilot 配置中，用于后台 SSH 状态扫描。</p>
+
+        <menu>
+          <button class="primary" id="submitSshPasswordBtn" value="default">保存并刷新</button>
+        </menu>
+      </form>
+    </dialog>
+
     <dialog id="settingsDialog" class="dialog">
       <form method="dialog" class="dialog-panel settings-panel">
         <header>
@@ -169,6 +243,14 @@
               <span>白色</span>
             </label>
           </div>
+        </section>
+
+        <section class="settings-section" aria-label="权限设置">
+          <div>
+            <h3>权限引导</h3>
+            <p>重新打开首次启动授权说明。</p>
+          </div>
+          <button type="button" class="settings-action" id="permissionGuideBtn">查看</button>
         </section>
       </form>
     </dialog>

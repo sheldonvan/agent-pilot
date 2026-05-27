@@ -531,6 +531,7 @@ h2 {
 }
 
 .agent-card h3 {
+  flex: 0 1 auto;
   margin: 0 0 2px;
   min-width: 0;
   overflow: hidden;
@@ -577,6 +578,27 @@ h2 {
   border-color: rgba(52, 199, 89, 0.35);
   background: rgba(52, 199, 89, 0.14);
   font-weight: 800;
+}
+
+.ssh-password-badge {
+  flex: 0 0 auto;
+  max-width: 118px;
+  padding: 4px 7px;
+  border-radius: 8px;
+  color: #b76a00;
+  border-color: rgba(255, 159, 10, 0.32);
+  background: rgba(255, 159, 10, 0.14);
+  box-shadow: none;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.ssh-password-badge:hover {
+  color: #8f5300;
+  border-color: rgba(255, 159, 10, 0.5);
+  background: rgba(255, 159, 10, 0.22);
 }
 
 .agent-name-input {
@@ -893,13 +915,30 @@ h2 {
   margin-bottom: 16px;
 }
 
+.dialog-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .settings-panel {
   width: min(360px, calc(100vw - 28px));
 }
 
 .settings-section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-section:first-of-type {
+  grid-template-columns: 1fr;
+  padding-top: 0;
+  border-top: 0;
 }
 
 .settings-section h3 {
@@ -913,6 +952,70 @@ h2 {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.settings-action {
+  min-width: 72px;
+  border-radius: 12px;
+  color: #0a6ee0;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.permission-panel {
+  width: min(430px, calc(100vw - 28px));
+}
+
+.permission-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.permission-item {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--soft-card);
+  box-shadow: var(--inner);
+}
+
+.permission-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(180deg, #4d9dff, #0a84ff);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.permission-item h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.permission-item p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.42;
+}
+
+.permission-action {
+  min-width: 56px;
+  padding: 7px 10px;
+  border-radius: 11px;
+  color: #0a6ee0;
+  font-size: 12px;
+  font-weight: 760;
 }
 
 .theme-options {

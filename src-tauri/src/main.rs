@@ -2,13 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -69,6 +71,7 @@ struct RemoteHost {
     ssh_host: String,
     ssh_user: String,
     ssh_port: u16,
+    ssh_password: Option<String>,
     scan_enabled: bool,
 }
 
@@ -93,6 +96,9 @@ struct AgentItem {
     tmux_pane: Option<String>,
     ssh_host: Option<String>,
     ssh_user: Option<String>,
+    ssh_port: Option<u16>,
+    #[serde(default)]
+    ssh_password_required: bool,
     started_at: Option<String>,
     updated_at: String,
     duration_sec: Option<u64>,
@@ -151,6 +157,8 @@ struct TerminalTarget {
     session_name: Option<String>,
     local_command: Option<String>,
     remote_command: Option<String>,
+    vscode_uri: Option<String>,
+    ghostty_terminal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +182,9 @@ struct DiscoveredAgent {
     tmux_pane: Option<String>,
     ssh_host: Option<String>,
     ssh_user: Option<String>,
+    ssh_port: Option<u16>,
+    #[serde(default)]
+    ssh_password_required: bool,
     discovery_source: String,
     confidence: f32,
     detected_at: String,
@@ -206,6 +217,7 @@ struct AgentEvent {
     tmux_pane: Option<String>,
     ssh_host: Option<String>,
     ssh_user: Option<String>,
+    ssh_port: Option<u16>,
     discovery_source: Option<String>,
 }
 
@@ -229,7 +241,41 @@ struct AppStore {
     config: Mutex<DeskConfig>,
 }
 
-const SCAN_DISCOVERY_SOURCES: [&str; 7] = [
+#[derive(Debug, Clone)]
+struct SshEndpoint {
+    host: String,
+    user: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GhosttyTerminal {
+    id: String,
+    name: String,
+    working_directory: String,
+}
+
+#[derive(Debug, Clone)]
+struct VscodeRemoteSession {
+    local_server_pid: u32,
+    code_pid: Option<u32>,
+    endpoint: SshEndpoint,
+    data_file_path: Option<PathBuf>,
+    socks_port: Option<u16>,
+    remote_port: Option<u16>,
+    exec_server_token: Option<String>,
+    local_forward_port: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRuntimeHint {
+    status: Option<AgentStatus>,
+    last_output: Option<String>,
+    cwd: Option<String>,
+}
+
+const SCAN_DISCOVERY_SOURCES: [&str; 10] = [
     "local_process",
     "local_ssh",
     "local_ssh_tmux",
@@ -237,7 +283,13 @@ const SCAN_DISCOVERY_SOURCES: [&str; 7] = [
     "codex_desktop",
     "remote_process",
     "remote_tmux",
+    "vscode_remote_ssh",
+    "vscode_remote_process",
+    "vscode_remote_tmux",
 ];
+
+const APP_VERSION: &str = "0.1.1";
+const VSCODE_REMOTE_EXEC_HELPER: &str = include_str!("../helpers/vscode_remote_exec.cjs");
 
 fn main() {
     let config = load_or_create_config();
@@ -246,7 +298,7 @@ fn main() {
         config.app.listen_host, config.app.listen_port
     );
     let snapshot = DeskSnapshot {
-        version: "0.1.0".to_string(),
+        version: APP_VERSION.to_string(),
         scanning: false,
         collector_online: false,
         collector_url,
@@ -272,9 +324,11 @@ fn main() {
             ignore_candidate,
             manual_agent,
             rename_agent,
+            save_ssh_password,
             post_event,
             open_terminal,
-            open_config_file
+            open_config_file,
+            open_permission_settings
         ])
         .setup(move |_app| {
             start_collector(setup_store.clone());
@@ -336,6 +390,17 @@ fn rename_agent(id: String, name: String, state: State<Arc<AppStore>>) -> ApiOk 
 }
 
 #[tauri::command]
+fn save_ssh_password(
+    ssh_host: String,
+    ssh_user: Option<String>,
+    ssh_port: Option<u16>,
+    password: String,
+    state: State<Arc<AppStore>>,
+) -> ApiOk {
+    save_ssh_password_inner(&state, &ssh_host, ssh_user.as_deref(), ssh_port, &password)
+}
+
+#[tauri::command]
 fn post_event(event: AgentEvent, state: State<Arc<AppStore>>) -> ApiOk {
     handle_event(&state, event)
 }
@@ -350,6 +415,11 @@ fn open_config_file() -> ApiOk {
     let path = config_path();
     let _ = Command::new("open").arg(path).spawn();
     ApiOk { ok: true }
+}
+
+#[tauri::command]
+fn open_permission_settings(pane: String) -> ApiOk {
+    open_permission_settings_inner(&pane)
 }
 
 fn start_background_scanner(store: Arc<AppStore>) {
@@ -475,7 +545,7 @@ fn handle_http_route(method: &str, path: &str, body: &str, store: &Arc<AppStore>
             200,
             json!({
                 "ok": true,
-                "version": "0.1.0",
+                "version": APP_VERSION,
                 "collectorUrl": store.snapshot.lock().map(|s| s.collector_url.clone()).unwrap_or_default()
             }),
         ),
@@ -533,6 +603,28 @@ fn handle_http_route(method: &str, path: &str, body: &str, store: &Arc<AppStore>
                 .unwrap_or_default();
             (200, json!(rename_agent_inner(store, id, name)))
         }
+        ("POST", "/api/ssh/password") => {
+            let payload: Value = parse_body(body);
+            let ssh_host = payload
+                .get("sshHost")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let ssh_user = payload.get("sshUser").and_then(Value::as_str);
+            let ssh_port = payload
+                .get("sshPort")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok());
+            let password = payload
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                200,
+                json!(save_ssh_password_inner(
+                    store, ssh_host, ssh_user, ssh_port, password
+                )),
+            )
+        }
         ("POST", "/api/events") => match serde_json::from_str::<AgentEvent>(body) {
             Ok(event) => (200, json!(handle_event(store, event))),
             Err(error) => (400, json!({ "ok": false, "error": error.to_string() })),
@@ -542,6 +634,14 @@ fn handle_http_route(method: &str, path: &str, body: &str, store: &Arc<AppStore>
             let target_value = payload.get("target").cloned().unwrap_or(payload);
             let target = serde_json::from_value::<TerminalTarget>(target_value).ok();
             (200, json!(open_terminal_inner(target)))
+        }
+        ("POST", "/api/permissions/open") => {
+            let payload: Value = parse_body(body);
+            let pane = payload
+                .get("pane")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (200, json!(open_permission_settings_inner(pane)))
         }
         _ => (404, json!({ "ok": false, "error": "not_found" })),
     }
@@ -559,10 +659,13 @@ fn run_scan(store: &Arc<AppStore>) -> ScanResponse {
     let mut reports = Vec::new();
 
     if config.discovery.enabled && config.discovery.scan_local_processes {
-        let (items, report) = scan_local_processes();
+        let (items, report) = scan_local_processes(&config.remote_hosts);
         detected.extend(items);
         reports.push(report);
         let (items, report) = scan_codex_desktop();
+        detected.extend(items);
+        reports.push(report);
+        let (items, report) = scan_vscode_remote_ssh(&config.remote_hosts);
         detected.extend(items);
         reports.push(report);
     }
@@ -571,8 +674,28 @@ fn run_scan(store: &Arc<AppStore>) -> ScanResponse {
         detected.extend(items);
         reports.push(report);
     }
+    let active_session_endpoints = active_ssh_session_endpoints(&detected);
     if config.discovery.enabled && config.discovery.scan_remote_hosts {
         for host in config.remote_hosts.iter().filter(|host| host.scan_enabled) {
+            if active_session_endpoints.iter().any(|endpoint| {
+                remote_host_matches_endpoint(
+                    host,
+                    endpoint.user.as_deref(),
+                    &endpoint.host,
+                    endpoint.port,
+                )
+            }) {
+                reports.push(ScanReport {
+                    source: "remote_hosts".to_string(),
+                    label: host.label.clone(),
+                    ok: true,
+                    message:
+                        "skipped global remote scan because an active SSH terminal session is monitored directly"
+                            .to_string(),
+                    checked_at: now_iso(),
+                });
+                continue;
+            }
             let (process_items, process_report) = scan_remote_processes(host);
             let (tmux_items, tmux_report) = scan_remote_tmux(host);
             detected.extend(process_items);
@@ -640,6 +763,28 @@ fn run_scan(store: &Arc<AppStore>) -> ScanResponse {
         new_count,
         removed_count,
     }
+}
+
+fn active_ssh_session_endpoints(items: &[DiscoveredAgent]) -> Vec<SshEndpoint> {
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::new();
+    for item in items.iter().filter(|item| {
+        item.discovery_source == "local_ssh" || item.discovery_source == "vscode_remote_ssh"
+    }) {
+        let Some(host) = item.ssh_host.clone() else {
+            continue;
+        };
+        let endpoint = SshEndpoint {
+            host,
+            user: item.ssh_user.clone(),
+            port: item.ssh_port,
+            password: None,
+        };
+        if seen.insert(endpoint_label(&endpoint)) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
 }
 
 fn confirm_candidate_inner(
@@ -723,6 +868,77 @@ fn rename_agent_inner(store: &Arc<AppStore>, id: &str, name: &str) -> ApiOk {
     ApiOk { ok: true }
 }
 
+fn save_ssh_password_inner(
+    store: &Arc<AppStore>,
+    ssh_host: &str,
+    ssh_user: Option<&str>,
+    ssh_port: Option<u16>,
+    password: &str,
+) -> ApiOk {
+    let ssh_host = ssh_host.trim();
+    let ssh_user = ssh_user.and_then(non_empty_string);
+    let password = password.trim();
+    if ssh_host.is_empty() || password.is_empty() {
+        return ApiOk { ok: false };
+    }
+    let ssh_port = ssh_port.unwrap_or(22);
+
+    if let Ok(mut config) = store.config.lock() {
+        if let Some(host) = config.remote_hosts.iter_mut().find(|host| {
+            remote_host_matches_endpoint(host, ssh_user.as_deref(), ssh_host, Some(ssh_port))
+        }) {
+            if let Some(user) = ssh_user.as_ref() {
+                if host.ssh_user.trim().is_empty() {
+                    host.ssh_user = user.clone();
+                }
+            }
+            host.ssh_port = ssh_port;
+            host.ssh_password = Some(password.to_string());
+            host.scan_enabled = false;
+        } else {
+            let endpoint = SshEndpoint {
+                host: ssh_host.to_string(),
+                user: ssh_user.clone(),
+                port: Some(ssh_port),
+                password: None,
+            };
+            config.remote_hosts.push(RemoteHost {
+                id: format!("ssh-{}", config_id_fragment(&endpoint_label(&endpoint))),
+                label: endpoint_label(&endpoint),
+                ssh_host: ssh_host.to_string(),
+                ssh_user: ssh_user.clone().unwrap_or_default(),
+                ssh_port,
+                ssh_password: Some(password.to_string()),
+                scan_enabled: false,
+            });
+        }
+        save_config(&config);
+    } else {
+        return ApiOk { ok: false };
+    }
+
+    if let Ok(mut snapshot) = store.snapshot.lock() {
+        for agent in &mut snapshot.agents {
+            if endpoint_matches_agent(agent, ssh_user.as_deref(), ssh_host, Some(ssh_port)) {
+                agent.ssh_password_required = false;
+                agent.last_output =
+                    Some("SSH 密码已保存到本机配置；下次扫描会尝试用它读取远程状态。".to_string());
+                agent.updated_at = now_iso();
+            }
+        }
+        for candidate in &mut snapshot.candidates {
+            if endpoint_matches_candidate(candidate, ssh_user.as_deref(), ssh_host, Some(ssh_port))
+            {
+                candidate.ssh_password_required = false;
+            }
+        }
+        snapshot.last_updated = now_iso();
+        persist_agents(store, snapshot.agents.clone());
+    }
+
+    ApiOk { ok: true }
+}
+
 fn handle_event(store: &Arc<AppStore>, event: AgentEvent) -> ApiOk {
     let agent_id = event
         .agent_id
@@ -782,6 +998,7 @@ fn handle_event(store: &Arc<AppStore>, event: AgentEvent) -> ApiOk {
         tmux_pane,
         ssh_host,
         ssh_user,
+        ssh_port,
         discovery_source,
     } = event;
 
@@ -805,7 +1022,7 @@ fn handle_event(store: &Arc<AppStore>, event: AgentEvent) -> ApiOk {
             Some(session.clone()),
             ssh_host.clone(),
             ssh_user.clone(),
-            Some(22),
+            ssh_port,
         ))
     });
 
@@ -829,10 +1046,12 @@ fn handle_event(store: &Arc<AppStore>, event: AgentEvent) -> ApiOk {
         tmux_pane,
         ssh_host,
         ssh_user,
+        ssh_port,
         started_at: Some(now.clone()),
         updated_at: now.clone(),
         duration_sec: Some(0),
         terminal_target,
+        ssh_password_required: false,
     };
 
     if complete_for_auto_add {
@@ -860,6 +1079,8 @@ fn handle_event(store: &Arc<AppStore>, event: AgentEvent) -> ApiOk {
                 tmux_pane: agent.tmux_pane,
                 ssh_host: agent.ssh_host,
                 ssh_user: agent.ssh_user,
+                ssh_port: agent.ssh_port,
+                ssh_password_required: false,
                 discovery_source: "hook_report".to_string(),
                 confidence: 0.95,
                 detected_at: now.clone(),
@@ -894,6 +1115,23 @@ fn open_terminal_inner(target: Option<TerminalTarget>) -> ApiOk {
     ApiOk { ok: true }
 }
 
+fn open_permission_settings_inner(pane: &str) -> ApiOk {
+    let url = match pane {
+        "automation" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+        }
+        "full_disk" => "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+        _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    };
+    ApiOk {
+        ok: Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| true)
+            .unwrap_or(false),
+    }
+}
+
 fn open_command_in_terminal(terminal_app: &str, command: &str) {
     match terminal_app {
         "terminal" => {
@@ -912,15 +1150,13 @@ fn open_command_in_terminal(terminal_app: &str, command: &str) {
         }
         _ => {
             let _ = Command::new("open")
-                .args([
-                    "-n", "-a", "Ghostty", "--args", "-e", "zsh", "-lc", &command,
-                ])
+                .args(["-a", "Ghostty", "--args", "-e", "zsh", "-lc", &command])
                 .spawn();
         }
     }
 }
 
-fn scan_local_processes() -> (Vec<DiscoveredAgent>, ScanReport) {
+fn scan_local_processes(remote_hosts: &[RemoteHost]) -> (Vec<DiscoveredAgent>, ScanReport) {
     let checked_at = now_iso();
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,tty=,command="])
@@ -952,6 +1188,9 @@ fn scan_local_processes() -> (Vec<DiscoveredAgent>, ScanReport) {
             if tty_text == "??" {
                 return None;
             }
+            if is_agent_pilot_internal_ssh_command(&command) {
+                return None;
+            }
             let terminal_pid = find_terminal_parent_pid(parent_pid);
             let tty = Some(tty_text.to_string());
             if let Some(candidate) = infer_local_ssh_candidate(
@@ -960,19 +1199,31 @@ fn scan_local_processes() -> (Vec<DiscoveredAgent>, ScanReport) {
                 parent_pid,
                 terminal_pid,
                 tty.clone(),
+                remote_hosts,
                 &checked_at,
             ) {
                 return Some(candidate);
             }
             let kind = infer_process_kind(&command)?;
-            let cwd = infer_cwd(&command);
+            let mut cwd = infer_cwd(&command);
             let confidence = if cwd.is_some() { 0.82 } else { 0.72 };
             let fingerprint = format!("local:{}:{}", kind_key(&kind), pid);
-            let (status, last_output) = tty
+            let (mut status, mut last_output) = tty
                 .as_deref()
                 .and_then(capture_terminal_tab_text_by_tty)
                 .map(|output| infer_status_from_terminal_text(&output, Some(&command)))
                 .unwrap_or((None, None));
+            if let Some(runtime) = local_agent_runtime_hint(&kind, pid) {
+                if runtime.status.is_some() {
+                    status = runtime.status;
+                }
+                if runtime.last_output.is_some() {
+                    last_output = runtime.last_output;
+                }
+                if runtime.cwd.is_some() {
+                    cwd = runtime.cwd;
+                }
+            }
             Some(DiscoveredAgent {
                 fingerprint,
                 agent_id: None,
@@ -992,6 +1243,8 @@ fn scan_local_processes() -> (Vec<DiscoveredAgent>, ScanReport) {
                 tmux_pane: None,
                 ssh_host: None,
                 ssh_user: None,
+                ssh_port: None,
+                ssh_password_required: false,
                 discovery_source: "local_process".to_string(),
                 confidence,
                 detected_at: checked_at.clone(),
@@ -1051,6 +1304,8 @@ fn scan_local_tmux() -> (Vec<DiscoveredAgent>, ScanReport) {
         "Local Mac",
         None,
         None,
+        None,
+        "local_tmux",
         &checked_at,
     );
     enrich_local_tmux_status(&mut items);
@@ -1117,6 +1372,8 @@ fn scan_codex_desktop() -> (Vec<DiscoveredAgent>, ScanReport) {
             tmux_pane: None,
             ssh_host: None,
             ssh_user: None,
+            ssh_port: None,
+            ssh_password_required: false,
             discovery_source: "codex_desktop".to_string(),
             confidence: 0.9,
             detected_at: checked_at.clone(),
@@ -1234,50 +1491,145 @@ fn is_codex_completion_event(method: &str) -> bool {
     )
 }
 
-fn scan_remote_processes(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport) {
-    let checked_at = now_iso();
-    let target = format!("{}@{}", host.ssh_user, host.ssh_host);
-    let remote = "pgrep -af '(claude|codex)' || true";
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=2",
-            "-o",
-            "BatchMode=yes",
-            "-p",
-            &host.ssh_port.to_string(),
-            &target,
-            remote,
-        ])
-        .output();
-    let Ok(output) = output else {
-        return (
-            Vec::new(),
-            ScanReport {
-                source: "remote_process".to_string(),
-                label: host.label.clone(),
-                ok: false,
-                message: "ssh command failed".to_string(),
-                checked_at,
-            },
-        );
+fn local_agent_runtime_hint(kind: &AgentKind, pid: u32) -> Option<AgentRuntimeHint> {
+    match kind {
+        AgentKind::ClaudeCode => {
+            let path = home_path(&format!(".claude/sessions/{pid}.json"))?;
+            let text = fs::read_to_string(path).ok()?;
+            parse_agent_runtime_hint(kind, Some(pid), &text)
+        }
+        _ => None,
+    }
+}
+
+fn parse_agent_runtime_hint(
+    kind: &AgentKind,
+    _pid: Option<u32>,
+    text: &str,
+) -> Option<AgentRuntimeHint> {
+    match kind {
+        AgentKind::ClaudeCode => parse_claude_runtime_hint(text),
+        _ => None,
+    }
+}
+
+fn parse_claude_runtime_hint(text: &str) -> Option<AgentRuntimeHint> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let raw_status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let waiting_for = value
+        .get("waitingFor")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string);
+    let cwd = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string);
+
+    let status = match raw_status.as_str() {
+        "waiting" | "blocked" | "approval" | "needs_approval" => {
+            Some(AgentStatus::WaitingAttention)
+        }
+        "running" | "busy" | "working" => Some(AgentStatus::Running),
+        "done" | "complete" | "completed" | "idle" | "stopped" => Some(AgentStatus::Done),
+        "error" | "failed" => Some(AgentStatus::Error),
+        _ if waiting_for.is_some() => Some(AgentStatus::WaitingAttention),
+        _ => None,
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let items: Vec<DiscoveredAgent> = text
-        .lines()
+    let last_output = match status.as_ref() {
+        Some(AgentStatus::WaitingAttention) => Some(
+            waiting_for
+                .map(|reason| format!("Claude Code 等待处理：{reason}"))
+                .unwrap_or_else(|| "Claude Code 等待处理。".to_string()),
+        ),
+        Some(AgentStatus::Running) => Some("Claude Code 正在运行。".to_string()),
+        Some(AgentStatus::Done) => Some("Claude Code 已完成。".to_string()),
+        Some(AgentStatus::Error) => Some("Claude Code 报告执行错误。".to_string()),
+        _ => None,
+    };
+
+    Some(AgentRuntimeHint {
+        status,
+        last_output,
+        cwd,
+    })
+}
+
+fn endpoint_from_remote_host(host: &RemoteHost) -> SshEndpoint {
+    SshEndpoint {
+        host: host.ssh_host.clone(),
+        user: non_empty_string(&host.ssh_user),
+        port: Some(host.ssh_port),
+        password: host
+            .ssh_password
+            .clone()
+            .and_then(|value| non_empty_string(&value)),
+    }
+}
+
+fn scan_remote_process_candidates(
+    endpoint: &SshEndpoint,
+    machine_label: &str,
+    discovery_source: &str,
+    confidence: f32,
+    checked_at: &str,
+) -> Result<Vec<DiscoveredAgent>, String> {
+    let output =
+        ssh_output(endpoint, remote_agent_process_script()).map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(parse_remote_process_lines(
+        &String::from_utf8_lossy(&output.stdout),
+        endpoint,
+        machine_label,
+        discovery_source,
+        confidence,
+        checked_at,
+    ))
+}
+
+fn remote_agent_process_script() -> &'static str {
+    "for pid in $(pgrep -f '([c]laude|[c]odex)' 2>/dev/null || true); do cmd=$(ps -p \"$pid\" -o args= 2>/dev/null || true); [ -n \"$cmd\" ] || continue; cwd=$(readlink \"/proc/$pid/cwd\" 2>/dev/null || true); runtime=\"\"; if [ -r \"$HOME/.claude/sessions/$pid.json\" ]; then runtime=$(tr '\\n\\t' '  ' < \"$HOME/.claude/sessions/$pid.json\"); fi; printf '%s\\t%s\\t%s\\t%s\\n' \"$pid\" \"$cwd\" \"$cmd\" \"$runtime\"; done"
+}
+
+fn parse_remote_process_lines(
+    text: &str,
+    endpoint: &SshEndpoint,
+    machine_label: &str,
+    discovery_source: &str,
+    confidence: f32,
+    checked_at: &str,
+) -> Vec<DiscoveredAgent> {
+    text.lines()
         .filter_map(|line| {
-            let trimmed = line.trim();
-            let (pid_text, command) = trimmed.split_once(' ')?;
-            let pid = pid_text.trim().parse::<u32>().ok()?;
+            let mut parts = line.splitn(4, '\t');
+            let pid_text = parts.next()?.trim();
+            let cwd_text = parts.next().unwrap_or_default().trim();
+            let command = parts.next()?.trim();
+            let runtime_text = parts.next().unwrap_or_default().trim();
+            let pid = pid_text.parse::<u32>().ok()?;
             let kind = infer_process_kind(command)?;
-            let cwd = infer_cwd(command);
+            let mut cwd = if cwd_text.is_empty() {
+                infer_cwd(command)
+            } else {
+                Some(cwd_text.to_string())
+            };
+            let runtime = parse_agent_runtime_hint(&kind, Some(pid), runtime_text);
+            if let Some(runtime_cwd) = runtime.as_ref().and_then(|runtime| runtime.cwd.clone()) {
+                cwd = Some(runtime_cwd);
+            }
             let fingerprint = format!(
-                "remote:{}@{}:{}:{}:{}",
-                host.ssh_user,
-                host.ssh_host,
+                "remote:{}@{}:{}:{}",
+                endpoint.user.clone().unwrap_or_default(),
+                endpoint.host,
                 kind_key(&kind),
-                pid,
-                command
+                pid
             );
             Some(DiscoveredAgent {
                 fingerprint,
@@ -1285,32 +1637,322 @@ fn scan_remote_processes(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport
                 name: None,
                 kind,
                 location: AgentLocation::Remote,
-                machine_label: host.label.clone(),
+                machine_label: machine_label.to_string(),
                 cwd,
                 command: Some(command.to_string()),
-                last_output: None,
-                status: None,
+                last_output: runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.last_output.clone()),
+                status: runtime.and_then(|runtime| runtime.status),
                 pid: Some(pid),
                 parent_pid: None,
                 terminal_pid: None,
                 tty: None,
                 tmux_session: None,
                 tmux_pane: None,
-                ssh_host: Some(host.ssh_host.clone()),
-                ssh_user: Some(host.ssh_user.clone()),
-                discovery_source: "remote_process".to_string(),
-                confidence: 0.68,
-                detected_at: checked_at.clone(),
+                ssh_host: Some(endpoint.host.clone()),
+                ssh_user: endpoint.user.clone(),
+                ssh_port: endpoint.port,
+                ssh_password_required: false,
+                discovery_source: discovery_source.to_string(),
+                confidence,
+                detected_at: checked_at.to_string(),
             })
         })
-        .collect();
+        .collect()
+}
+
+fn ssh_output(endpoint: &SshEndpoint, remote: &str) -> std::io::Result<std::process::Output> {
+    if endpoint
+        .password
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        if let Some(output) = ssh_output_with_saved_password(endpoint, remote) {
+            return output;
+        }
+    }
+
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("ConnectTimeout=2")
+        .arg("-o")
+        .arg("BatchMode=yes");
+    if let Some(port) = endpoint.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    command.arg(ssh_target(endpoint.user.as_deref(), &endpoint.host));
+    command.arg(remote);
+    command.output()
+}
+
+fn ssh_output_with_saved_password(
+    endpoint: &SshEndpoint,
+    remote: &str,
+) -> Option<std::io::Result<std::process::Output>> {
+    let password = endpoint.password.as_deref()?.trim();
+    if password.is_empty() {
+        return None;
+    }
+
+    let pass_path = std::env::temp_dir().join(format!(
+        "agent-pilot-sshpass-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    if fs::write(&pass_path, password).is_err() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&pass_path, fs::Permissions::from_mode(0o600));
+    }
+
+    let output = if let Some(sshpass) = command_path("sshpass") {
+        let mut command = Command::new(sshpass);
+        command
+            .arg("-f")
+            .arg(&pass_path)
+            .arg("ssh")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg("-o")
+            .arg("BatchMode=no")
+            .arg("-o")
+            .arg("NumberOfPasswordPrompts=1")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new");
+        if let Some(port) = endpoint.port {
+            command.arg("-p").arg(port.to_string());
+        }
+        command.arg(ssh_target(endpoint.user.as_deref(), &endpoint.host));
+        command.arg(remote);
+        command.output()
+    } else {
+        ssh_output_with_askpass(endpoint, remote, &pass_path)
+    };
+
+    let _ = fs::remove_file(pass_path);
+    Some(output)
+}
+
+fn ssh_output_with_askpass(
+    endpoint: &SshEndpoint,
+    remote: &str,
+    pass_path: &PathBuf,
+) -> std::io::Result<std::process::Output> {
+    let askpass_path = std::env::temp_dir().join(format!(
+        "agent-pilot-askpass-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    let script = format!(
+        "#!/bin/sh\ncat {}\n",
+        shell_quote(&pass_path.to_string_lossy())
+    );
+    fs::write(&askpass_path, script)?;
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o700));
+    }
+
+    let mut command = Command::new("ssh");
+    command
+        .env("SSH_ASKPASS", &askpass_path)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .stdin(Stdio::null())
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-o")
+        .arg("BatchMode=no")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=1")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(port) = endpoint.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    command.arg(ssh_target(endpoint.user.as_deref(), &endpoint.host));
+    command.arg(remote);
+    let output = command.output();
+    let _ = fs::remove_file(askpass_path);
+    output
+}
+
+fn ssh_command_needs_password(endpoint: &SshEndpoint) -> bool {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("ConnectTimeout=2")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=0")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(port) = endpoint.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    command.arg(ssh_target(endpoint.user.as_deref(), &endpoint.host));
+    command.arg("true");
+
+    let Ok(output) = command.output() else {
+        return false;
+    };
+    if output.status.success() {
+        return false;
+    }
+    ssh_error_mentions_password(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn ssh_error_mentions_password(stderr: &str) -> bool {
+    let lowered = stderr.to_lowercase();
+    [
+        "permission denied",
+        "password",
+        "publickey",
+        "keyboard-interactive",
+        "authentication",
+        "authentications that can continue",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn command_path(command: &str) -> Option<String> {
+    for prefix in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        let path = PathBuf::from(prefix).join(command);
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    let output = Command::new("/usr/bin/which").arg(command).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn ssh_target(user: Option<&str>, host: &str) -> String {
+    match user.filter(|value| !value.trim().is_empty()) {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
+    }
+}
+
+fn endpoint_label(endpoint: &SshEndpoint) -> String {
+    let user_prefix = endpoint
+        .user
+        .as_ref()
+        .map(|user| format!("{user}@"))
+        .unwrap_or_default();
+    let port_suffix = endpoint
+        .port
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{user_prefix}{}{port_suffix}", endpoint.host)
+}
+
+fn vscode_remote_fingerprint(endpoint: &SshEndpoint) -> String {
+    format!(
+        "vscode-remote-ssh:{}@{}:{:?}",
+        endpoint.user.clone().unwrap_or_default(),
+        endpoint.host,
+        endpoint.port
+    )
+}
+
+fn vscode_remote_authority(endpoint: &SshEndpoint) -> String {
+    match endpoint.user.as_deref().filter(|value| !value.is_empty()) {
+        Some(user) => format!("{user}@{}", endpoint.host),
+        None => endpoint.host.clone(),
+    }
+}
+
+fn vscode_remote_uri(endpoint: &SshEndpoint, cwd: Option<&str>) -> String {
+    let authority = uri_encode_component(&vscode_remote_authority(endpoint));
+    let path = cwd
+        .map(str::trim)
+        .filter(|value| value.starts_with('/'))
+        .unwrap_or("/");
+    format!(
+        "vscode://vscode-remote/ssh-remote+{}{}",
+        authority,
+        uri_encode_path(path)
+    )
+}
+
+fn vscode_remote_uri_from_candidate(candidate: &DiscoveredAgent) -> Option<String> {
+    let host = candidate.ssh_host.clone()?;
+    let endpoint = SshEndpoint {
+        host,
+        user: candidate.ssh_user.clone(),
+        port: candidate.ssh_port,
+        password: None,
+    };
+    Some(vscode_remote_uri(&endpoint, candidate.cwd.as_deref()))
+}
+
+fn vscode_file_uri(cwd: Option<&str>) -> Option<String> {
+    let path = cwd.map(str::trim).filter(|value| value.starts_with('/'))?;
+    Some(format!("vscode://file{}", uri_encode_path(path)))
+}
+
+fn uri_encode_component(value: &str) -> String {
+    uri_encode_with_slash_mode(value, false)
+}
+
+fn uri_encode_path(value: &str) -> String {
+    uri_encode_with_slash_mode(value, true)
+}
+
+fn uri_encode_with_slash_mode(value: &str, keep_slash: bool) -> String {
+    let mut out = String::new();
+    for &byte in value.as_bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && byte == b'/');
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn scan_remote_processes(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport) {
+    let checked_at = now_iso();
+    let endpoint = endpoint_from_remote_host(host);
+    let result =
+        scan_remote_process_candidates(&endpoint, &host.label, "remote_process", 0.68, &checked_at);
+    let Ok(items) = result else {
+        return (
+            Vec::new(),
+            ScanReport {
+                source: "remote_process".to_string(),
+                label: host.label.clone(),
+                ok: false,
+                message: "ssh command failed or authentication is not available".to_string(),
+                checked_at,
+            },
+        );
+    };
     let count = items.len();
     (
         items,
         ScanReport {
             source: "remote_process".to_string(),
             label: host.label.clone(),
-            ok: output.status.success(),
+            ok: true,
             message: format!("found {count} remote process candidates"),
             checked_at,
         },
@@ -1319,40 +1961,20 @@ fn scan_remote_processes(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport
 
 fn scan_remote_tmux(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport) {
     let checked_at = now_iso();
-    let target = format!("{}@{}", host.ssh_user, host.ssh_host);
-    let remote = "tmux list-panes -a -F '#{session_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}' || true";
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=2",
-            "-o",
-            "BatchMode=yes",
-            "-p",
-            &host.ssh_port.to_string(),
-            &target,
-            remote,
-        ])
-        .output();
-    let Ok(output) = output else {
+    let endpoint = endpoint_from_remote_host(host);
+    let result = scan_remote_tmux_candidates(&endpoint, &host.label, "remote_tmux", &checked_at);
+    let Ok(mut items) = result else {
         return (
             Vec::new(),
             ScanReport {
                 source: "remote_tmux".to_string(),
                 label: host.label.clone(),
                 ok: false,
-                message: "ssh command failed".to_string(),
+                message: "ssh command failed or authentication is not available".to_string(),
                 checked_at,
             },
         );
     };
-    let mut items = parse_tmux_lines(
-        &String::from_utf8_lossy(&output.stdout),
-        AgentLocation::Remote,
-        &host.label,
-        Some(&host.ssh_host),
-        Some(&host.ssh_user),
-        &checked_at,
-    );
     enrich_remote_tmux_status(&mut items, host);
     let count = items.len();
     (
@@ -1360,11 +1982,536 @@ fn scan_remote_tmux(host: &RemoteHost) -> (Vec<DiscoveredAgent>, ScanReport) {
         ScanReport {
             source: "remote_tmux".to_string(),
             label: host.label.clone(),
-            ok: output.status.success(),
+            ok: true,
             message: format!("found {count} remote tmux candidates"),
             checked_at,
         },
     )
+}
+
+fn scan_vscode_remote_ssh(remote_hosts: &[RemoteHost]) -> (Vec<DiscoveredAgent>, ScanReport) {
+    let checked_at = now_iso();
+    let mut sessions = discover_vscode_remote_sessions();
+    if sessions.is_empty() {
+        return (
+            Vec::new(),
+            ScanReport {
+                source: "vscode_remote_ssh".to_string(),
+                label: "VS Code Remote-SSH".to_string(),
+                ok: true,
+                message: "no active VS Code Remote-SSH sessions".to_string(),
+                checked_at,
+            },
+        );
+    }
+
+    let mut items = Vec::new();
+    let mut monitored = 0;
+    for session in &mut sessions {
+        session.endpoint.password = matching_remote_host_password(
+            remote_hosts,
+            session.endpoint.user.as_deref(),
+            &session.endpoint.host,
+            session.endpoint.port,
+        );
+        let label = format!("VS Code SSH · {}", endpoint_label(&session.endpoint));
+        let mut session_item = vscode_remote_session_candidate(session, &label, &checked_at);
+        if let Ok(child_items) =
+            scan_vscode_terminal_process_candidates(session, &label, &checked_at)
+        {
+            monitored += 1;
+            apply_vscode_remote_child_status(&mut session_item, &child_items);
+        } else if session.endpoint.password.is_none()
+            && ssh_command_needs_password(&session.endpoint)
+        {
+            session_item.ssh_password_required = true;
+            session_item.status = Some(AgentStatus::WaitingAttention);
+            session_item.last_output = Some(
+                "这个 VS Code Remote-SSH 会话需要 SSH 密码，保存后 Agent Pilot 才能在后台补充远端状态扫描。"
+                    .to_string(),
+            );
+        }
+        items.push(session_item);
+    }
+
+    let count = items.len();
+    let message = if monitored > 0 {
+        format!(
+            "found {count} VS Code SSH session(s); monitored integrated terminals for {monitored} session(s)"
+        )
+    } else {
+        format!(
+            "found {count} VS Code SSH session(s); waiting for an accessible VS Code terminal channel"
+        )
+    };
+
+    (
+        items,
+        ScanReport {
+            source: "vscode_remote_ssh".to_string(),
+            label: "VS Code Remote-SSH".to_string(),
+            ok: monitored > 0,
+            message,
+            checked_at,
+        },
+    )
+}
+
+fn apply_vscode_remote_child_status(
+    session_item: &mut DiscoveredAgent,
+    child_items: &[DiscoveredAgent],
+) {
+    if let Some(attention_item) = child_items
+        .iter()
+        .find(|item| matches!(item.status, Some(AgentStatus::WaitingAttention)))
+    {
+        session_item.kind = attention_item.kind.clone();
+        session_item.command = attention_item
+            .command
+            .clone()
+            .or(session_item.command.clone());
+        session_item.confidence = session_item.confidence.max(attention_item.confidence);
+        session_item.status = Some(AgentStatus::WaitingAttention);
+        session_item.last_output = attention_item.last_output.clone().or_else(|| {
+            Some(format!(
+                "VS Code Remote-SSH 中的 {} 等待处理。",
+                kind_label(&attention_item.kind)
+            ))
+        });
+        session_item.cwd = attention_item.cwd.clone().or(session_item.cwd.clone());
+        return;
+    }
+
+    if let Some(running_item) = child_items
+        .iter()
+        .find(|item| matches!(item.status, Some(AgentStatus::Running)))
+    {
+        session_item.kind = running_item.kind.clone();
+        session_item.command = running_item
+            .command
+            .clone()
+            .or(session_item.command.clone());
+        session_item.confidence = session_item.confidence.max(running_item.confidence);
+        session_item.status = Some(AgentStatus::Running);
+        session_item.last_output = running_item
+            .last_output
+            .clone()
+            .or_else(|| Some("VS Code 集成终端中的 Agent 正在运行。".to_string()));
+        session_item.cwd = running_item.cwd.clone().or(session_item.cwd.clone());
+        return;
+    }
+
+    if let Some(done_item) = child_items
+        .iter()
+        .find(|item| matches!(item.status, Some(AgentStatus::Done)))
+    {
+        session_item.kind = done_item.kind.clone();
+        session_item.command = done_item.command.clone().or(session_item.command.clone());
+        session_item.confidence = session_item.confidence.max(done_item.confidence);
+        session_item.status = Some(AgentStatus::Done);
+        session_item.last_output = done_item.last_output.clone();
+        session_item.cwd = done_item.cwd.clone().or(session_item.cwd.clone());
+    } else if child_items.is_empty() {
+        session_item.last_output =
+            Some("VS Code Remote-SSH 已连接；集成终端中未检测到活动 Agent。".to_string());
+    }
+}
+
+fn scan_vscode_terminal_process_candidates(
+    session: &VscodeRemoteSession,
+    machine_label: &str,
+    checked_at: &str,
+) -> Result<Vec<DiscoveredAgent>, String> {
+    let stdout = match vscode_remote_exec_stdout(session, remote_vscode_terminal_agent_script()) {
+        Ok(stdout) => stdout,
+        Err(_) => {
+            let output = ssh_output(&session.endpoint, remote_vscode_terminal_agent_script())
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+    };
+    Ok(parse_remote_process_lines(
+        &stdout,
+        &session.endpoint,
+        machine_label,
+        "vscode_remote_ssh",
+        0.78,
+        checked_at,
+    ))
+}
+
+fn remote_vscode_terminal_agent_script() -> &'static str {
+    "ptyhosts=$(ps -eo pid=,args= 2>/dev/null | awk '/bootstrap-fork --type=ptyHost/ && !/awk/ {print $1}'); is_vscode_term_child() { current=\"$1\"; depth=0; while [ -n \"$current\" ] && [ \"$current\" -gt 1 ] 2>/dev/null && [ \"$depth\" -lt 32 ]; do for host in $ptyhosts; do [ \"$current\" = \"$host\" ] && return 0; done; current=$(ps -p \"$current\" -o ppid= 2>/dev/null | tr -d ' '); depth=$((depth + 1)); done; return 1; }; for pid in $(pgrep -f '([c]laude|[c]odex)' 2>/dev/null || true); do is_vscode_term_child \"$pid\" || continue; cmd=$(ps -p \"$pid\" -o args= 2>/dev/null || true); [ -n \"$cmd\" ] || continue; cwd=$(readlink \"/proc/$pid/cwd\" 2>/dev/null || true); runtime=\"\"; if [ -r \"$HOME/.claude/sessions/$pid.json\" ]; then runtime=$(tr '\\n\\t' '  ' < \"$HOME/.claude/sessions/$pid.json\"); fi; printf '%s\\t%s\\t%s\\t%s\\n' \"$pid\" \"$cwd\" \"$cmd\" \"$runtime\"; done"
+}
+
+fn vscode_remote_exec_stdout(
+    session: &VscodeRemoteSession,
+    remote_script: &str,
+) -> Result<String, String> {
+    let port = session
+        .local_forward_port
+        .ok_or_else(|| "VS Code Remote-SSH local forwarding port was not found".to_string())?;
+    let token = session
+        .exec_server_token
+        .as_ref()
+        .ok_or_else(|| "VS Code Remote-SSH exec server token was not found".to_string())?;
+    let electron_node = vscode_electron_node_path()
+        .ok_or_else(|| "VS Code Electron Node runtime was not found".to_string())?;
+    let helper_path = std::env::temp_dir().join(format!(
+        "agent-pilot-vscode-remote-exec-{}.cjs",
+        std::process::id()
+    ));
+    fs::write(&helper_path, VSCODE_REMOTE_EXEC_HELPER)
+        .map_err(|error| format!("failed to write VS Code helper: {error}"))?;
+
+    let payload = json!({
+        "port": port,
+        "token": token,
+        "command": "sh",
+        "args": ["-c", remote_script],
+        "timeoutMs": 12000,
+    });
+    let output = Command::new(electron_node)
+        .env("ELECTRON_RUN_AS_NODE", "1")
+        .arg(&helper_path)
+        .arg(payload.to_string())
+        .output()
+        .map_err(|error| format!("failed to run VS Code helper: {error}"))?;
+    let _ = fs::remove_file(&helper_path);
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|error| format!("invalid VS Code helper output: {error}"))?;
+    if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("VS Code helper failed")
+            .to_string());
+    }
+    let result = value
+        .get("result")
+        .ok_or_else(|| "VS Code helper returned no result".to_string())?;
+    let exit_code = result
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if exit_code != 0 {
+        let stderr = result
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+    }
+    Ok(result
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn vscode_electron_node_path() -> Option<&'static str> {
+    [
+        "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)",
+        "/Applications/Visual Studio Code - Insiders.app/Contents/Frameworks/Code - Insiders Helper (Plugin).app/Contents/MacOS/Code - Insiders Helper (Plugin)",
+    ]
+    .into_iter()
+    .find(|path| PathBuf::from(path).exists())
+}
+
+fn vscode_remote_session_candidate(
+    session: &VscodeRemoteSession,
+    label: &str,
+    checked_at: &str,
+) -> DiscoveredAgent {
+    let output = if session.local_forward_port.is_some() && session.exec_server_token.is_some() {
+        "VS Code Remote-SSH session detected. Agent Pilot can reuse the VS Code connection to monitor remote Claude/Codex processes."
+    } else {
+        "VS Code Remote-SSH session detected. Waiting for VS Code exec server details to monitor remote Claude/Codex processes."
+    };
+    DiscoveredAgent {
+        fingerprint: vscode_remote_fingerprint(&session.endpoint),
+        agent_id: None,
+        name: Some(label.to_string()),
+        kind: AgentKind::Other,
+        location: AgentLocation::Remote,
+        machine_label: label.to_string(),
+        cwd: Some(format!(
+            "VS Code Remote-SSH · {}",
+            endpoint_label(&session.endpoint)
+        )),
+        command: Some("VS Code Remote-SSH".to_string()),
+        last_output: Some(output.to_string()),
+        status: Some(AgentStatus::Running),
+        pid: Some(session.local_server_pid),
+        parent_pid: None,
+        terminal_pid: session.code_pid,
+        tty: None,
+        tmux_session: None,
+        tmux_pane: None,
+        ssh_host: Some(session.endpoint.host.clone()),
+        ssh_user: session.endpoint.user.clone(),
+        ssh_port: session.endpoint.port,
+        ssh_password_required: false,
+        discovery_source: "vscode_remote_ssh".to_string(),
+        confidence: 0.72,
+        detected_at: checked_at.to_string(),
+    }
+}
+
+fn discover_vscode_remote_sessions() -> Vec<VscodeRemoteSession> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    let mut sessions = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        let mut pieces = trimmed.split_whitespace();
+        let Some(pid_text) = pieces.next() else {
+            continue;
+        };
+        let Some(parent_pid_text) = pieces.next() else {
+            continue;
+        };
+        let command = pieces.collect::<Vec<_>>().join(" ");
+        if !command.contains("localServer.js")
+            || !command.contains("ms-vscode-remote.remote-ssh")
+            || !command.contains("\"sshArgs\"")
+        {
+            continue;
+        }
+        let Some(local_server_pid) = pid_text.parse::<u32>().ok() else {
+            continue;
+        };
+        let Some(mut session) = parse_vscode_remote_session(
+            local_server_pid,
+            parent_pid_text.parse::<u32>().ok(),
+            &command,
+        ) else {
+            continue;
+        };
+        enrich_vscode_remote_session_from_data_file(&mut session);
+        let key = vscode_remote_fingerprint(&session.endpoint);
+        if seen.insert(key) {
+            sessions.push(session);
+        }
+    }
+    sessions
+}
+
+fn parse_vscode_remote_session(
+    local_server_pid: u32,
+    parent_pid: Option<u32>,
+    command: &str,
+) -> Option<VscodeRemoteSession> {
+    let json_start = command.find('{')?;
+    let value = serde_json::from_str::<Value>(&command[json_start..]).ok()?;
+    let ssh_args = value
+        .get("sshArgs")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let (user, host, port) = extract_ssh_destination_from_args(&ssh_args)?;
+    let data_file_path = value
+        .get("dataFilePath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+
+    Some(VscodeRemoteSession {
+        local_server_pid,
+        code_pid: find_vscode_parent_pid(parent_pid),
+        endpoint: SshEndpoint {
+            host,
+            user,
+            port,
+            password: None,
+        },
+        data_file_path,
+        socks_port: None,
+        remote_port: None,
+        exec_server_token: None,
+        local_forward_port: None,
+    })
+}
+
+fn enrich_vscode_remote_session_from_data_file(session: &mut VscodeRemoteSession) {
+    let Some(path) = &session.data_file_path else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    session.socks_port = value
+        .get("socksPort")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .or(session.socks_port);
+    session.remote_port = value
+        .get("remoteListeningOn")
+        .and_then(|value| value.get("port"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .or(session.remote_port);
+    session.exec_server_token = value
+        .get("execServerToken")
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+        .or(session.exec_server_token.clone());
+    session.local_forward_port = find_vscode_remote_forward_port(session);
+}
+
+fn find_vscode_remote_forward_port(session: &VscodeRemoteSession) -> Option<u16> {
+    let log_root = home_path("Library/Application Support/Code/logs")?;
+    let mut paths = Vec::new();
+    collect_vscode_remote_logs(&log_root, 0, &mut paths);
+    paths.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    paths.reverse();
+
+    for path in paths.into_iter().take(48) {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        if !vscode_remote_log_matches_session(&text, session) {
+            continue;
+        }
+        if let Some(port) = parse_vscode_remote_forward_port_from_log(&text, session) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn collect_vscode_remote_logs(dir: &PathBuf, depth: usize, paths: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_vscode_remote_logs(&path, depth + 1, paths);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.contains("Remote - SSH.log") {
+            paths.push(path);
+        }
+    }
+}
+
+fn vscode_remote_log_matches_session(text: &str, session: &VscodeRemoteSession) -> bool {
+    let host_match = text.contains(&format!("ssh-remote+{}", session.endpoint.host))
+        || text.contains(&format!("\"{}\"", session.endpoint.host))
+        || text.contains(&format!(" {}", session.endpoint.host));
+    let data_file_match = session
+        .data_file_path
+        .as_ref()
+        .map(|path| {
+            let path_text = path.to_string_lossy();
+            text.contains(path_text.as_ref())
+        })
+        .unwrap_or(false);
+    host_match || data_file_match
+}
+
+fn parse_vscode_remote_forward_port_from_log(
+    text: &str,
+    session: &VscodeRemoteSession,
+) -> Option<u16> {
+    for line in text.lines().rev() {
+        if let Some(remote_port) = session.remote_port {
+            let remote_marker = format!("remotePort {remote_port}");
+            let socks_matches = session
+                .socks_port
+                .map(|port| line.contains(&format!("socksPort {port}")))
+                .unwrap_or(true);
+            if line.contains("Starting forwarding server.")
+                && line.contains(&remote_marker)
+                && socks_matches
+            {
+                if let Some(port) = extract_u16_after(line, "local port ") {
+                    return Some(port);
+                }
+            }
+        }
+
+        let resolved_marker = format!(
+            "Resolved \"ssh-remote+{}\" to \"port ",
+            session.endpoint.host
+        );
+        if line.contains(&resolved_marker) {
+            if let Some(port) = extract_u16_after(line, &resolved_marker) {
+                return Some(port);
+            }
+        }
+
+        if line.contains("Resolving exec server at port ") {
+            if let Some(port) = extract_u16_after(line, "Resolving exec server at port ") {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+fn extract_u16_after(text: &str, marker: &str) -> Option<u16> {
+    let index = text.find(marker)? + marker.len();
+    let digits = text[index..]
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u16>().ok()
+}
+
+fn scan_remote_tmux_candidates(
+    endpoint: &SshEndpoint,
+    machine_label: &str,
+    discovery_source: &str,
+    checked_at: &str,
+) -> Result<Vec<DiscoveredAgent>, String> {
+    let remote = "tmux list-panes -a -F '#{session_name}|#{pane_index}|#{pane_current_command}|#{pane_current_path}' || true";
+    let output = ssh_output(endpoint, remote).map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(parse_tmux_lines(
+        &String::from_utf8_lossy(&output.stdout),
+        AgentLocation::Remote,
+        machine_label,
+        Some(&endpoint.host),
+        endpoint.user.as_ref(),
+        endpoint.port,
+        discovery_source,
+        checked_at,
+    ))
 }
 
 fn parse_tmux_lines(
@@ -1373,6 +2520,8 @@ fn parse_tmux_lines(
     machine_label: &str,
     ssh_host: Option<&String>,
     ssh_user: Option<&String>,
+    ssh_port: Option<u16>,
+    discovery_source: &str,
     checked_at: &str,
 ) -> Vec<DiscoveredAgent> {
     text.lines()
@@ -1433,11 +2582,9 @@ fn parse_tmux_lines(
                 tmux_pane: Some(pane),
                 ssh_host: ssh_host.cloned(),
                 ssh_user: ssh_user.cloned(),
-                discovery_source: match &location {
-                    AgentLocation::Local => "local_tmux",
-                    AgentLocation::Remote => "remote_tmux",
-                }
-                .to_string(),
+                ssh_port,
+                ssh_password_required: false,
+                discovery_source: discovery_source.to_string(),
                 confidence,
                 detected_at: checked_at.to_string(),
             })
@@ -1497,35 +2644,16 @@ fn capture_local_tmux_pane(session: &str, pane: &str) -> Option<String> {
 
 fn capture_remote_tmux_pane(host: &RemoteHost, session: &str, pane: &str) -> Option<String> {
     let target = format!("{session}:{pane}");
-    capture_ssh_tmux_output(Some(&host.ssh_user), &host.ssh_host, host.ssh_port, &target)
+    let endpoint = endpoint_from_remote_host(host);
+    capture_ssh_tmux_output_endpoint(&endpoint, &target)
 }
 
-fn capture_ssh_tmux_output(
-    ssh_user: Option<&String>,
-    ssh_host: &str,
-    ssh_port: u16,
-    target: &str,
-) -> Option<String> {
+fn capture_ssh_tmux_output_endpoint(endpoint: &SshEndpoint, target: &str) -> Option<String> {
     let remote = format!(
         "tmux capture-pane -p -S -80 -t {} || true",
         shell_quote(target)
     );
-    let ssh_target = ssh_user
-        .map(|user| format!("{user}@{ssh_host}"))
-        .unwrap_or_else(|| ssh_host.to_string());
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=2",
-            "-o",
-            "BatchMode=yes",
-            "-p",
-            &ssh_port.to_string(),
-            &ssh_target,
-            &remote,
-        ])
-        .output()
-        .ok()?;
+    let output = ssh_output(endpoint, &remote).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1683,6 +2811,14 @@ fn update_managed_from_candidate(agents: &mut [AgentItem], candidate: &Discovere
             agent.status = candidate.status.clone().unwrap_or(AgentStatus::Running);
             agent.updated_at = now_iso();
             agent.machine_label = candidate.machine_label.clone();
+            if candidate.discovery_source == "vscode_remote_ssh" {
+                agent.kind = candidate.kind.clone();
+                agent.confidence = Some(candidate.confidence);
+                agent.current_task = Some(
+                    "检测到 VS Code Remote-SSH 会话；正在通过 VS Code 连接通道监看远端 Agent。"
+                        .to_string(),
+                );
+            }
             agent.pid = candidate.pid.or(agent.pid);
             agent.tmux_session = candidate
                 .tmux_session
@@ -1697,6 +2833,8 @@ fn update_managed_from_candidate(agents: &mut [AgentItem], candidate: &Discovere
                 .or(agent.last_output.clone());
             agent.ssh_host = candidate.ssh_host.clone().or(agent.ssh_host.clone());
             agent.ssh_user = candidate.ssh_user.clone().or(agent.ssh_user.clone());
+            agent.ssh_port = candidate.ssh_port.or(agent.ssh_port);
+            agent.ssh_password_required = candidate.ssh_password_required;
             if candidate.discovery_source == "local_ssh" {
                 agent
                     .discovery_sources
@@ -1706,6 +2844,17 @@ fn update_managed_from_candidate(agents: &mut [AgentItem], candidate: &Discovere
                 build_process_terminal_target(candidate)
             } else if candidate.discovery_source == "codex_desktop" {
                 build_desktop_app_target(candidate)
+            } else if is_vscode_remote_discovery_source(&candidate.discovery_source) {
+                build_vscode_remote_target(candidate)
+            } else if should_use_remote_process_terminal_target(candidate) {
+                build_remote_process_terminal_target(
+                    candidate,
+                    agent
+                        .terminal_target
+                        .as_ref()
+                        .map(|target| target.terminal_app.as_str())
+                        .unwrap_or("ghostty"),
+                )
             } else {
                 build_terminal_target(
                     &candidate.location,
@@ -1721,7 +2870,7 @@ fn update_managed_from_candidate(agents: &mut [AgentItem], candidate: &Discovere
                         .or(agent.tmux_session.clone()),
                     candidate.ssh_host.clone().or(agent.ssh_host.clone()),
                     candidate.ssh_user.clone().or(agent.ssh_user.clone()),
-                    Some(22),
+                    candidate.ssh_port.or(agent.ssh_port),
                 )
             });
             if !agent
@@ -1847,6 +2996,7 @@ fn infer_local_ssh_candidate(
     parent_pid: Option<u32>,
     terminal_pid: Option<u32>,
     tty: Option<String>,
+    remote_hosts: &[RemoteHost],
     checked_at: &str,
 ) -> Option<DiscoveredAgent> {
     let tokens = command.split_whitespace().collect::<Vec<_>>();
@@ -1873,7 +3023,18 @@ fn infer_local_ssh_candidate(
     });
     let session = tmux_index.and_then(|index| extract_tmux_session(&tokens[index + 1..]));
     let (ssh_user, ssh_host, ssh_port) = extract_ssh_destination(&tokens)?;
-    let kind = session
+    let endpoint = SshEndpoint {
+        host: ssh_host.clone(),
+        user: ssh_user.clone(),
+        port: ssh_port,
+        password: matching_remote_host_password(
+            remote_hosts,
+            ssh_user.as_deref(),
+            &ssh_host,
+            ssh_port,
+        ),
+    };
+    let mut kind = session
         .as_deref()
         .and_then(infer_kind)
         .or_else(|| infer_kind(command))
@@ -1888,21 +3049,47 @@ fn infer_local_ssh_candidate(
         .as_ref()
         .map(|session| format!("{} · {}", kind_label(&kind), session))
         .unwrap_or_else(|| format!("SSH · {remote_label}"));
+    let mut remote_agent_cwd = None;
     let captured_output = session
         .as_deref()
-        .and_then(|session| {
-            capture_ssh_tmux_output(
-                ssh_user.as_ref(),
-                &ssh_host,
-                ssh_port.unwrap_or(22),
-                session,
-            )
-        })
+        .and_then(|session| capture_ssh_tmux_output_endpoint(&endpoint, session))
         .or_else(|| tty.as_deref().and_then(capture_terminal_tab_text_by_tty));
-    let (status, last_output) = captured_output
+
+    let mut status = None;
+    let mut last_output = None;
+    let mut remote_scan_failed = false;
+    if session.is_none() {
+        if let Ok(remote_agents) =
+            scan_remote_process_candidates(&endpoint, &remote_label, "local_ssh", 0.72, checked_at)
+        {
+            if let Some(active_agent) = prioritized_remote_agent(&remote_agents) {
+                kind = active_agent.kind.clone();
+                remote_agent_cwd = active_agent.cwd.clone();
+                status = active_agent.status.clone();
+                last_output = active_agent
+                    .last_output
+                    .clone()
+                    .or(active_agent.command.clone());
+            }
+        } else {
+            remote_scan_failed = true;
+        }
+    }
+
+    let (text_status, text_last_output) = captured_output
         .as_deref()
         .map(|output| infer_status_from_terminal_text(output, Some(command)))
         .unwrap_or((None, None));
+    if text_status.is_some() {
+        status = text_status;
+    }
+    if text_last_output.is_some() {
+        last_output = text_last_output;
+    }
+    let ssh_password_required = endpoint.password.is_none()
+        && ((session.is_none() && remote_scan_failed)
+            || (session.is_some() && captured_output.is_none()))
+        && ssh_command_needs_password(&endpoint);
 
     Some(DiscoveredAgent {
         fingerprint: format!("local-ssh:{pid}"),
@@ -1914,6 +3101,7 @@ fn infer_local_ssh_candidate(
         cwd: session
             .as_ref()
             .map(|session| format!("{remote_label} · tmux:{session}"))
+            .or(remote_agent_cwd)
             .or_else(|| Some(remote_label)),
         command: Some(command.to_string()),
         last_output,
@@ -1926,10 +3114,138 @@ fn infer_local_ssh_candidate(
         tmux_pane: None,
         ssh_host: Some(ssh_host),
         ssh_user,
+        ssh_port,
+        ssh_password_required,
         discovery_source: "local_ssh".to_string(),
         confidence: 0.86,
         detected_at: checked_at.to_string(),
     })
+}
+
+fn matching_remote_host_password(
+    remote_hosts: &[RemoteHost],
+    ssh_user: Option<&str>,
+    ssh_host: &str,
+    ssh_port: Option<u16>,
+) -> Option<String> {
+    remote_hosts.iter().find_map(|host| {
+        if !remote_host_matches_endpoint(host, ssh_user, ssh_host, ssh_port) {
+            return None;
+        }
+        host.ssh_password.as_deref().and_then(non_empty_string)
+    })
+}
+
+fn remote_host_matches_endpoint(
+    host: &RemoteHost,
+    ssh_user: Option<&str>,
+    ssh_host: &str,
+    ssh_port: Option<u16>,
+) -> bool {
+    if host.ssh_host != ssh_host {
+        return false;
+    }
+    if let Some(user) = ssh_user {
+        if !host.ssh_user.is_empty() && host.ssh_user != user {
+            return false;
+        }
+    }
+    if let Some(port) = ssh_port {
+        if host.ssh_port != port {
+            return false;
+        }
+    }
+    true
+}
+
+fn endpoint_matches_agent(
+    agent: &AgentItem,
+    ssh_user: Option<&str>,
+    ssh_host: &str,
+    ssh_port: Option<u16>,
+) -> bool {
+    endpoint_parts_match(
+        agent.ssh_user.as_deref(),
+        agent.ssh_host.as_deref(),
+        agent.ssh_port,
+        ssh_user,
+        ssh_host,
+        ssh_port,
+    )
+}
+
+fn endpoint_matches_candidate(
+    candidate: &DiscoveredAgent,
+    ssh_user: Option<&str>,
+    ssh_host: &str,
+    ssh_port: Option<u16>,
+) -> bool {
+    endpoint_parts_match(
+        candidate.ssh_user.as_deref(),
+        candidate.ssh_host.as_deref(),
+        candidate.ssh_port,
+        ssh_user,
+        ssh_host,
+        ssh_port,
+    )
+}
+
+fn endpoint_parts_match(
+    item_user: Option<&str>,
+    item_host: Option<&str>,
+    item_port: Option<u16>,
+    ssh_user: Option<&str>,
+    ssh_host: &str,
+    ssh_port: Option<u16>,
+) -> bool {
+    if item_host != Some(ssh_host) {
+        return false;
+    }
+    if let Some(user) = ssh_user {
+        if item_user.unwrap_or_default() != user {
+            return false;
+        }
+    }
+    if let Some(port) = ssh_port {
+        if item_port.unwrap_or(22) != port {
+            return false;
+        }
+    }
+    true
+}
+
+fn config_id_fragment(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn prioritized_remote_agent(items: &[DiscoveredAgent]) -> Option<&DiscoveredAgent> {
+    items
+        .iter()
+        .find(|item| matches!(item.status, Some(AgentStatus::WaitingAttention)))
+        .or_else(|| {
+            items
+                .iter()
+                .find(|item| matches!(item.status, Some(AgentStatus::Running)))
+        })
+        .or_else(|| {
+            items
+                .iter()
+                .find(|item| matches!(item.status, Some(AgentStatus::Done)))
+        })
+        .or_else(|| items.first())
 }
 
 fn extract_tmux_session(tokens: &[&str]) -> Option<String> {
@@ -1949,27 +3265,51 @@ fn extract_tmux_session(tokens: &[&str]) -> Option<String> {
 }
 
 fn extract_ssh_destination(tokens: &[&str]) -> Option<(Option<String>, String, Option<u16>)> {
+    extract_ssh_destination_from_tokens(&tokens.iter().skip(1).copied().collect::<Vec<_>>())
+}
+
+fn extract_ssh_destination_from_args(
+    args: &[String],
+) -> Option<(Option<String>, String, Option<u16>)> {
+    extract_ssh_destination_from_tokens(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn extract_ssh_destination_from_tokens(
+    tokens: &[&str],
+) -> Option<(Option<String>, String, Option<u16>)> {
     let mut ssh_user = None;
     let mut ssh_host = None;
     let mut ssh_port = None;
     let mut skip_next = false;
     let options_with_values = [
-        "-b", "-c", "-e", "-i", "-J", "-l", "-m", "-o", "-p", "-S", "-W",
+        "-b", "-B", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
+        "-p", "-Q", "-R", "-S", "-W", "-w",
     ];
 
-    for (index, token) in tokens.iter().enumerate().skip(1) {
+    for (index, token) in tokens.iter().enumerate() {
         if skip_next {
             skip_next = false;
             continue;
         }
 
-        if *token == "-l" {
+        let token = *token;
+
+        if token == "--" {
+            continue;
+        }
+
+        if token == "-l" {
             ssh_user = tokens.get(index + 1).map(|value| clean_shell_token(value));
             skip_next = true;
             continue;
         }
 
-        if *token == "-p" {
+        if let Some(user_text) = token.strip_prefix("-l").filter(|value| !value.is_empty()) {
+            ssh_user = Some(clean_shell_token(user_text));
+            continue;
+        }
+
+        if token == "-p" {
             ssh_port = tokens
                 .get(index + 1)
                 .and_then(|value| clean_shell_token(value).parse::<u16>().ok());
@@ -1978,12 +3318,18 @@ fn extract_ssh_destination(tokens: &[&str]) -> Option<(Option<String>, String, O
         }
 
         if let Some(port_text) = token.strip_prefix("-p") {
-            ssh_port = port_text.parse::<u16>().ok();
+            if !port_text.is_empty() {
+                ssh_port = port_text.parse::<u16>().ok();
+                continue;
+            }
+        }
+
+        if options_with_values.iter().any(|option| *option == token) {
+            skip_next = true;
             continue;
         }
 
-        if options_with_values.iter().any(|option| option == token) {
-            skip_next = true;
+        if is_attached_ssh_option_with_value(token) {
             continue;
         }
 
@@ -2005,12 +3351,30 @@ fn extract_ssh_destination(tokens: &[&str]) -> Option<(Option<String>, String, O
     ssh_host.map(|host| (ssh_user, host, ssh_port))
 }
 
+fn is_attached_ssh_option_with_value(token: &str) -> bool {
+    [
+        "-b", "-B", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-m", "-O", "-o", "-Q",
+        "-R", "-S", "-W", "-w",
+    ]
+    .iter()
+    .any(|option| token.starts_with(option) && token.len() > option.len())
+}
+
 fn clean_shell_token(value: &str) -> String {
     value
         .trim_matches('"')
         .trim_matches('\'')
         .trim_end_matches(';')
         .to_string()
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn infer_cwd(command: &str) -> Option<String> {
@@ -2043,6 +3407,10 @@ fn agent_from_candidate(candidate: DiscoveredAgent, name: String) -> AgentItem {
         build_desktop_app_target(&candidate)
     } else if should_use_process_terminal_target(&candidate) {
         build_process_terminal_target(&candidate)
+    } else if is_vscode_remote_discovery_source(&candidate.discovery_source) {
+        build_vscode_remote_target(&candidate)
+    } else if should_use_remote_process_terminal_target(&candidate) {
+        build_remote_process_terminal_target(&candidate, "ghostty")
     } else {
         build_terminal_target(
             &candidate.location,
@@ -2051,7 +3419,7 @@ fn agent_from_candidate(candidate: DiscoveredAgent, name: String) -> AgentItem {
             Some(session_name.clone()),
             candidate.ssh_host.clone(),
             candidate.ssh_user.clone(),
-            Some(22),
+            candidate.ssh_port,
         )
     };
     AgentItem {
@@ -2077,6 +3445,8 @@ fn agent_from_candidate(candidate: DiscoveredAgent, name: String) -> AgentItem {
         cwd: candidate.cwd,
         current_task: Some(if candidate.discovery_source == "codex_desktop" {
             "监测 Codex Desktop 审批与任务状态。".to_string()
+        } else if candidate.discovery_source == "vscode_remote_ssh" {
+            "检测到 VS Code Remote-SSH 会话；正在通过 VS Code 连接通道监看远端 Agent。".to_string()
         } else {
             "刚加入管理，等待下一次状态上报。".to_string()
         }),
@@ -2089,6 +3459,7 @@ fn agent_from_candidate(candidate: DiscoveredAgent, name: String) -> AgentItem {
         tmux_session: candidate.tmux_session.or_else(|| {
             if terminal_target.target_type == "local-process"
                 || terminal_target.target_type == "desktop-app"
+                || terminal_target.target_type == "ssh-process"
             {
                 None
             } else {
@@ -2098,6 +3469,8 @@ fn agent_from_candidate(candidate: DiscoveredAgent, name: String) -> AgentItem {
         tmux_pane: candidate.tmux_pane,
         ssh_host: candidate.ssh_host,
         ssh_user: candidate.ssh_user,
+        ssh_port: candidate.ssh_port,
+        ssh_password_required: candidate.ssh_password_required,
         started_at: Some(candidate.detected_at),
         updated_at: now_iso(),
         duration_sec: Some(0),
@@ -2129,6 +3502,8 @@ fn build_terminal_target(
             session_name: Some(session.clone()),
             local_command: None,
             remote_command: Some(format!("tmux attach -t {session} || tmux new -s {session}")),
+            vscode_uri: None,
+            ghostty_terminal_id: None,
         },
         AgentLocation::Local => {
             let dir = cwd.unwrap_or_else(|| "~".to_string());
@@ -2150,6 +3525,8 @@ fn build_terminal_target(
                     shell_quote(&session)
                 )),
                 remote_command: None,
+                vscode_uri: None,
+                ghostty_terminal_id: None,
             }
         }
     }
@@ -2169,19 +3546,83 @@ fn build_desktop_app_target(candidate: &DiscoveredAgent) -> TerminalTarget {
         session_name: Some("Codex Desktop".to_string()),
         local_command: None,
         remote_command: None,
+        vscode_uri: None,
+        ghostty_terminal_id: None,
+    }
+}
+
+fn build_vscode_remote_target(candidate: &DiscoveredAgent) -> TerminalTarget {
+    TerminalTarget {
+        target_type: "desktop-app".to_string(),
+        terminal_app: "vscode".to_string(),
+        process_pid: candidate.terminal_pid,
+        terminal_pid: candidate.terminal_pid,
+        tty: None,
+        process_command: candidate.command.clone(),
+        ssh_host: candidate.ssh_host.clone(),
+        ssh_user: candidate.ssh_user.clone(),
+        ssh_port: candidate.ssh_port,
+        session_name: Some(
+            candidate
+                .ssh_host
+                .clone()
+                .unwrap_or_else(|| "VS Code Remote-SSH".to_string()),
+        ),
+        local_command: None,
+        remote_command: None,
+        vscode_uri: vscode_remote_uri_from_candidate(candidate),
+        ghostty_terminal_id: None,
+    }
+}
+
+fn build_remote_process_terminal_target(
+    candidate: &DiscoveredAgent,
+    terminal_app: &str,
+) -> TerminalTarget {
+    let pid = candidate.pid.unwrap_or_default();
+    let cwd = candidate.cwd.clone().unwrap_or_else(|| "~".to_string());
+    let mut remote_command = format!(
+        "cd {} 2>/dev/null || true; ps -p {} -o pid,ppid,tty,stat,args",
+        shell_quote(&cwd),
+        pid
+    );
+    if let Some(command) = candidate
+        .command
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        remote_command.push_str(&format!(
+            "; printf '%s\\n' {} {}",
+            shell_quote("Command:"),
+            shell_quote(command)
+        ));
+    }
+    remote_command.push_str("; printf '\\nPress enter to close...'; read -r _");
+
+    TerminalTarget {
+        target_type: "ssh-process".to_string(),
+        terminal_app: terminal_app.to_string(),
+        process_pid: candidate.pid,
+        terminal_pid: None,
+        tty: None,
+        process_command: candidate.command.clone(),
+        ssh_host: candidate.ssh_host.clone(),
+        ssh_user: candidate.ssh_user.clone(),
+        ssh_port: candidate.ssh_port,
+        session_name: Some(format!("{}_pid_{pid}", kind_key(&candidate.kind))),
+        local_command: None,
+        remote_command: Some(remote_command),
+        vscode_uri: None,
+        ghostty_terminal_id: None,
     }
 }
 
 fn terminal_command(target: &TerminalTarget) -> String {
-    if target.target_type == "ssh-tmux" {
+    if target.target_type == "ssh-tmux" || target.target_type == "ssh-process" {
         let Some(host) = target.ssh_host.clone() else {
             return String::new();
         };
-        let user = target
-            .ssh_user
-            .clone()
-            .unwrap_or_else(|| "root".to_string());
-        let port = target.ssh_port.unwrap_or(22).to_string();
+        let ssh_target = ssh_target(target.ssh_user.as_deref(), &host);
         let remote = target
             .remote_command
             .clone()
@@ -2192,7 +3633,11 @@ fn terminal_command(target: &TerminalTarget) -> String {
                     .map(|session| format!("tmux attach -t {session} || tmux new -s {session}"))
             })
             .unwrap_or_else(|| "tmux ls".to_string());
-        format!("ssh -p {port} {user}@{host} -t {}", shell_quote(&remote))
+        let port_arg = target
+            .ssh_port
+            .map(|port| format!("-p {port} "))
+            .unwrap_or_default();
+        format!("ssh {port_arg}{ssh_target} -t {}", shell_quote(&remote))
     } else {
         target
             .local_command
@@ -2211,6 +3656,23 @@ fn terminal_command(target: &TerminalTarget) -> String {
 }
 
 fn focus_desktop_app(target: &TerminalTarget) -> bool {
+    if target.terminal_app == "vscode" {
+        if let Some(uri) = target
+            .vscode_uri
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if Command::new("open")
+                .arg(uri)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+
     if let Some(pid) = target.process_pid.or(target.terminal_pid) {
         let script = format!(
             "tell application \"System Events\" to set frontmost of first process whose unix id is {} to true",
@@ -2228,6 +3690,7 @@ fn focus_desktop_app(target: &TerminalTarget) -> bool {
 
     let app_name = match target.terminal_app.as_str() {
         "codex" => "Codex",
+        "vscode" => "Visual Studio Code",
         other => other,
     };
     let script = format!("tell application {} to activate", apple_quote(app_name));
@@ -2249,6 +3712,20 @@ fn build_process_terminal_target(candidate: &DiscoveredAgent) -> TerminalTarget 
         .terminal_pid
         .and_then(terminal_app_for_pid)
         .unwrap_or_else(|| "ghostty".to_string());
+    let vscode_uri = if terminal_app == "vscode" {
+        vscode_file_uri(candidate.cwd.as_deref())
+    } else {
+        None
+    };
+    let ghostty_terminal_id = if terminal_app == "ghostty" {
+        find_matching_ghostty_terminal_id(
+            candidate.command.as_deref(),
+            candidate.cwd.as_deref(),
+            candidate.tmux_session.as_deref(),
+        )
+    } else {
+        None
+    };
     let tty_label = candidate
         .tty
         .clone()
@@ -2263,13 +3740,20 @@ fn build_process_terminal_target(candidate: &DiscoveredAgent) -> TerminalTarget 
         ssh_host: None,
         ssh_user: None,
         ssh_port: None,
-        session_name: Some(format!("{}_pid_{pid}", kind_key(&candidate.kind))),
+        session_name: Some(
+            candidate
+                .tmux_session
+                .clone()
+                .unwrap_or_else(|| format!("{}_pid_{pid}", kind_key(&candidate.kind))),
+        ),
         local_command: Some(local_process_status_command(
             pid,
             &tty_label,
             candidate.command.as_deref(),
         )),
         remote_command: None,
+        vscode_uri,
+        ghostty_terminal_id,
     }
 }
 
@@ -2298,6 +3782,10 @@ fn local_process_status_command(
 }
 
 fn focus_local_process_terminal(target: &TerminalTarget) -> bool {
+    if target.terminal_app == "vscode" && focus_desktop_app(target) {
+        return true;
+    }
+
     if target.terminal_app == "terminal" {
         if let Some(tty) = &target.tty {
             if focus_terminal_tab_by_tty(tty) {
@@ -2308,6 +3796,9 @@ fn focus_local_process_terminal(target: &TerminalTarget) -> bool {
 
     if target.terminal_app == "ghostty" && focus_ghostty_terminal_by_title(target) {
         return true;
+    }
+    if target.terminal_app == "ghostty" {
+        return false;
     }
 
     if let Some(terminal_pid) = target.terminal_pid {
@@ -2328,6 +3819,7 @@ fn focus_local_process_terminal(target: &TerminalTarget) -> bool {
     let activate_target = match target.terminal_app.as_str() {
         "terminal" => "Terminal",
         "iterm" => "iTerm",
+        "vscode" => "Visual Studio Code",
         _ => "Ghostty",
     };
     let activate_script = format!("tell application \"{}\" to activate", activate_target);
@@ -2346,6 +3838,146 @@ fn focus_local_process_terminal(target: &TerminalTarget) -> bool {
     }
 
     false
+}
+
+fn ghostty_terminals() -> Vec<GhosttyTerminal> {
+    let script = r#"tell application "Ghostty"
+  set rows to {}
+  set fieldDelimiter to character id 9
+  repeat with ghostTerminal in terminals
+    set terminalId to id of ghostTerminal as text
+    set terminalName to name of ghostTerminal as text
+    set terminalCwd to working directory of ghostTerminal as text
+    set end of rows to terminalId & fieldDelimiter & terminalName & fieldDelimiter & terminalCwd
+  end repeat
+  set oldDelimiters to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to linefeed
+  set joinedRows to rows as text
+  set AppleScript's text item delimiters to oldDelimiters
+  return joinedRows
+end tell"#;
+
+    let mut command = Command::new("osascript");
+    command.args(["-e", script]);
+    let Some(output) = command_output_with_timeout(&mut command, Duration::from_millis(1400))
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let id = non_empty_string(parts.next().unwrap_or_default())?;
+            let name = parts.next().and_then(non_empty_string)?;
+            let working_directory = parts.next().and_then(non_empty_string).unwrap_or_default();
+            Some(GhosttyTerminal {
+                id,
+                name,
+                working_directory,
+            })
+        })
+        .collect()
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let started_at = SystemTime::now();
+    loop {
+        if child.try_wait().ok().flatten().is_some() {
+            return child.wait_with_output().ok();
+        }
+        if started_at
+            .elapsed()
+            .ok()
+            .map(|elapsed| elapsed >= timeout)
+            .unwrap_or(true)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn find_matching_ghostty_terminal_id(
+    process_command: Option<&str>,
+    cwd: Option<&str>,
+    tmux_session: Option<&str>,
+) -> Option<String> {
+    let terminals = ghostty_terminals();
+    let title_matches = terminals
+        .iter()
+        .filter(|terminal| ghostty_terminal_matches(terminal, process_command, None, tmux_session))
+        .collect::<Vec<_>>();
+    if title_matches.len() == 1 {
+        return title_matches.first().map(|terminal| terminal.id.clone());
+    }
+
+    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    let cwd_matches = terminals
+        .into_iter()
+        .filter(|terminal| terminal.working_directory == cwd)
+        .collect::<Vec<_>>();
+    if cwd_matches.len() == 1 {
+        cwd_matches.first().map(|terminal| terminal.id.clone())
+    } else {
+        None
+    }
+}
+
+fn ghostty_terminal_matches(
+    terminal: &GhosttyTerminal,
+    process_command: Option<&str>,
+    cwd: Option<&str>,
+    tmux_session: Option<&str>,
+) -> bool {
+    let title = normalize_match_text(&terminal.name);
+    let command = process_command
+        .map(normalize_match_text)
+        .unwrap_or_default();
+    if !command.is_empty() && title.contains(&command) {
+        return true;
+    }
+
+    if let Some(session) = tmux_session.map(normalize_match_text) {
+        if !session.is_empty() && title.contains(&session) && title.contains("tmux") {
+            return true;
+        }
+    }
+
+    if let Some(command_text) = process_command {
+        let tokens = command_text.split_whitespace().collect::<Vec<_>>();
+        if let Some((_, host, _)) = extract_ssh_destination(&tokens) {
+            if title.contains(&normalize_match_text(&host)) {
+                return tmux_session
+                    .map(|session| title.contains(&normalize_match_text(session)))
+                    .unwrap_or(true);
+            }
+        }
+    }
+
+    cwd.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| terminal.working_directory == value)
+        .unwrap_or(false)
+}
+
+fn normalize_match_text(value: &str) -> String {
+    value
+        .replace(['"', '\'', '\\'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn focus_terminal_tab_by_tty(tty: &str) -> bool {
@@ -2372,16 +4004,54 @@ return false"#,
         short_tty = apple_quote(short_tty)
     );
 
-    Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .ok()
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    command_output_with_timeout(&mut command, Duration::from_millis(1400))
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
         .unwrap_or(false)
 }
 
 fn focus_ghostty_terminal_by_title(target: &TerminalTarget) -> bool {
+    if let Some(terminal_id) = target
+        .ghostty_terminal_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if focus_ghostty_terminal_by_id(terminal_id) {
+            return true;
+        }
+    }
+    let tmux_session = target
+        .session_name
+        .as_deref()
+        .filter(|session| !session.contains("_pid_"))
+        .map(str::to_string)
+        .or_else(|| {
+            target
+                .process_command
+                .as_deref()
+                .and_then(tmux_session_from_process_command)
+        });
+    if let Some(terminal_id) = find_matching_ghostty_terminal_id(
+        target.process_command.as_deref(),
+        None,
+        tmux_session.as_deref(),
+    ) {
+        if focus_ghostty_terminal_by_id(&terminal_id) {
+            return true;
+        }
+    }
+    if let Some((ssh_host, session)) = target
+        .process_command
+        .as_deref()
+        .and_then(|command| ghostty_ssh_tmux_focus_terms(command, tmux_session.as_deref()))
+    {
+        if focus_ghostty_terminal_by_terms(&ssh_host, &session) {
+            return true;
+        }
+    }
+
     let Some(process_command) = target
         .process_command
         .as_deref()
@@ -2413,10 +4083,89 @@ return false"#,
         match_text = apple_quote(process_command)
     );
 
-    Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .ok()
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    command_output_with_timeout(&mut command, Duration::from_millis(1400))
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+fn ghostty_ssh_tmux_focus_terms(
+    process_command: &str,
+    tmux_session: Option<&str>,
+) -> Option<(String, String)> {
+    let tokens = process_command.split_whitespace().collect::<Vec<_>>();
+    let (_, host, _) = extract_ssh_destination(&tokens)?;
+    let session = tmux_session
+        .and_then(non_empty_string)
+        .or_else(|| tmux_session_from_process_command(process_command))?;
+    Some((host, session))
+}
+
+fn focus_ghostty_terminal_by_terms(ssh_host: &str, tmux_session: &str) -> bool {
+    let script = format!(
+        r#"tell application "Ghostty"
+  set matchedTerminal to missing value
+  set matchCount to 0
+  repeat with ghostTerminal in terminals
+    set terminalTitle to name of ghostTerminal as text
+    ignoring case
+      if terminalTitle contains {ssh_host} and terminalTitle contains {tmux_session} then
+        set matchedTerminal to ghostTerminal
+        set matchCount to matchCount + 1
+      end if
+    end ignoring
+  end repeat
+  if matchCount is 1 then
+    focus matchedTerminal
+    return true
+  end if
+end tell
+return false"#,
+        ssh_host = apple_quote(ssh_host),
+        tmux_session = apple_quote(tmux_session)
+    );
+
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    command_output_with_timeout(&mut command, Duration::from_millis(1400))
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+fn tmux_session_from_process_command(command: &str) -> Option<String> {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let tmux_index = tokens.iter().position(|token| {
+        token
+            .trim_matches('"')
+            .trim_matches('\'')
+            .rsplit('/')
+            .next()
+            .map(|name| name == "tmux")
+            .unwrap_or(false)
+    })?;
+    extract_tmux_session(&tokens[tmux_index + 1..])
+}
+
+fn focus_ghostty_terminal_by_id(terminal_id: &str) -> bool {
+    let script = format!(
+        r#"tell application "Ghostty"
+  repeat with ghostTerminal in terminals
+    if (id of ghostTerminal as text) is {terminal_id} then
+      focus ghostTerminal
+      return true
+    end if
+  end repeat
+end tell
+return false"#,
+        terminal_id = apple_quote(terminal_id)
+    );
+
+    let mut command = Command::new("osascript");
+    command.args(["-e", &script]);
+    command_output_with_timeout(&mut command, Duration::from_millis(1400))
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
         .unwrap_or(false)
@@ -2426,6 +4175,9 @@ fn open_local_process_terminal(target: &TerminalTarget) -> bool {
     if target.terminal_pid.is_some() && target.tty.is_some() && focus_local_process_terminal(target)
     {
         return true;
+    }
+    if target.terminal_app == "ghostty" {
+        return false;
     }
 
     let command = target
@@ -2455,7 +4207,21 @@ fn find_terminal_parent_pid(mut pid: Option<u32>) -> Option<u32> {
             || lowered.contains("terminal.app")
             || lowered.contains("iterm.app")
             || lowered.contains("iterm2.app")
+            || is_vscode_terminal_host_command(&lowered)
         {
+            return Some(current);
+        }
+        pid = process_parent_and_command(current).map(|(parent, _)| parent);
+    }
+    None
+}
+
+fn find_vscode_parent_pid(mut pid: Option<u32>) -> Option<u32> {
+    for _ in 0..10 {
+        let current = pid?;
+        let (_, command) = process_parent_and_command(current)?;
+        let lowered = command.to_lowercase();
+        if lowered.contains("visual studio code.app/contents/macos/code") {
             return Some(current);
         }
         pid = process_parent_and_command(current).map(|(parent, _)| parent);
@@ -2472,9 +4238,17 @@ fn terminal_app_for_pid(pid: u32) -> Option<String> {
         Some("iterm".to_string())
     } else if lowered.contains("ghostty.app") {
         Some("ghostty".to_string())
+    } else if is_vscode_terminal_host_command(&lowered) {
+        Some("vscode".to_string())
     } else {
         None
     }
+}
+
+fn is_vscode_terminal_host_command(lowered_command: &str) -> bool {
+    lowered_command.contains("visual studio code.app")
+        && lowered_command.contains("code helper")
+        && lowered_command.contains("node.mojom.nodeservice")
 }
 
 fn should_use_process_terminal_target(candidate: &DiscoveredAgent) -> bool {
@@ -2483,6 +4257,17 @@ fn should_use_process_terminal_target(candidate: &DiscoveredAgent) -> bool {
         || (candidate.discovery_source == "local_process"
             && matches!(candidate.location, AgentLocation::Local)
             && candidate.tmux_session.is_none())
+}
+
+fn should_use_remote_process_terminal_target(candidate: &DiscoveredAgent) -> bool {
+    matches!(candidate.location, AgentLocation::Remote)
+        && candidate.pid.is_some()
+        && candidate.tmux_session.is_none()
+        && matches!(candidate.discovery_source.as_str(), "remote_process")
+}
+
+fn is_vscode_remote_discovery_source(source: &str) -> bool {
+    matches!(source, "vscode_remote_ssh")
 }
 
 fn process_parent_and_command(pid: u32) -> Option<(u32, String)> {
@@ -2502,6 +4287,42 @@ fn process_parent_and_command(pid: u32) -> Option<(u32, String)> {
 
 fn agent_fingerprints(agent: &AgentItem) -> Vec<String> {
     let mut fingerprints = Vec::new();
+    if agent
+        .discovery_sources
+        .iter()
+        .any(|source| source == "vscode_remote_process" || source == "vscode_remote_tmux")
+        && !agent
+            .discovery_sources
+            .iter()
+            .any(|source| source == "vscode_remote_ssh")
+    {
+        fingerprints.push(format!("manual:{}", agent.id));
+        return fingerprints;
+    }
+    if agent
+        .discovery_sources
+        .iter()
+        .any(|source| source == "vscode_remote_ssh")
+    {
+        if let Some(host) = agent.ssh_host.clone() {
+            let endpoint = SshEndpoint {
+                host,
+                user: agent.ssh_user.clone(),
+                port: agent.ssh_port,
+                password: None,
+            };
+            fingerprints.push(vscode_remote_fingerprint(&endpoint));
+        }
+        if let Some(pid) = agent.pid {
+            fingerprints.push(format!(
+                "vscode-remote-ssh:{}@{}:{:?}:{}",
+                agent.ssh_user.clone().unwrap_or_default(),
+                agent.ssh_host.clone().unwrap_or_default(),
+                agent.ssh_port,
+                pid
+            ));
+        }
+    }
     if let (Some(pid), kind) = (agent.pid, &agent.kind) {
         if agent
             .discovery_sources
@@ -2516,6 +4337,13 @@ fn agent_fingerprints(agent: &AgentItem) -> Vec<String> {
         match &agent.location {
             AgentLocation::Local => fingerprints.push(format!("local:{}:{pid}", kind_key(kind))),
             AgentLocation::Remote => {
+                fingerprints.push(format!(
+                    "remote:{}@{}:{}:{}",
+                    agent.ssh_user.clone().unwrap_or_default(),
+                    agent.ssh_host.clone().unwrap_or_default(),
+                    kind_key(kind),
+                    pid
+                ));
                 if let Some(command) = &agent.last_output {
                     fingerprints.push(format!(
                         "remote:{}@{}:{}:{}:{}",
@@ -2577,6 +4405,17 @@ fn normalize_config(mut config: DeskConfig) -> DeskConfig {
     if config.discovery.remote_scan_interval_sec <= 45 {
         config.discovery.remote_scan_interval_sec = 60;
     }
+    for host in &mut config.remote_hosts {
+        let is_ui_saved_credential = host.id.starts_with("ssh-")
+            && host
+                .ssh_password
+                .as_deref()
+                .and_then(non_empty_string)
+                .is_some();
+        if is_ui_saved_credential {
+            host.scan_enabled = false;
+        }
+    }
     config
 }
 
@@ -2626,6 +4465,18 @@ fn sanitize_agents(agents: Vec<AgentItem>) -> Vec<AgentItem> {
     agents
         .into_iter()
         .filter(|agent| {
+            if agent
+                .discovery_sources
+                .iter()
+                .any(|source| source == "vscode_remote_process" || source == "vscode_remote_tmux")
+                && !agent
+                    .discovery_sources
+                    .iter()
+                    .any(|source| source == "vscode_remote_ssh")
+            {
+                return false;
+            }
+
             if agent.id.starts_with("demo-") {
                 return false;
             }
@@ -2669,6 +4520,15 @@ fn is_ignored_process_text(lowered: &str) -> bool {
     ignored_needles
         .iter()
         .any(|needle| lowered.contains(needle))
+}
+
+fn is_agent_pilot_internal_ssh_command(command: &str) -> bool {
+    let lowered = command.to_lowercase();
+    lowered.contains("numberofpasswordprompts=1")
+        && lowered.contains("stricthostkeychecking=accept-new")
+        && (lowered.contains("tmux capture-pane")
+            || lowered.contains("pgrep -f")
+            || lowered.contains("bootstrap-fork --type=ptyhost"))
 }
 
 fn push_scan_report(store: &Arc<AppStore>, report: ScanReport) {
@@ -2749,6 +4609,198 @@ fn kind_label(kind: &AgentKind) -> &'static str {
         AgentKind::ClaudeCode => "Claude Code",
         AgentKind::Other => "Agent",
         AgentKind::Unknown => "Agent",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vscode_remote_ssh_destination() {
+        let args = [
+            "-v",
+            "-T",
+            "-D",
+            "61160",
+            "-o",
+            "ConnectTimeout=15",
+            "172.16.4.25-ct",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            extract_ssh_destination_from_args(&args),
+            Some((None, "172.16.4.25-ct".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn parses_explicit_ssh_user_and_port() {
+        let tokens = ["ssh", "-t", "root@172.16.4.25", "-p", "30291", "tmux"];
+
+        assert_eq!(
+            extract_ssh_destination(&tokens),
+            Some((
+                Some("root".to_string()),
+                "172.16.4.25".to_string(),
+                Some(30291)
+            ))
+        );
+    }
+
+    #[test]
+    fn maps_claude_waiting_session_to_attention() {
+        let hint = parse_claude_runtime_hint(
+            r#"{"pid":59600,"status":"waiting","waitingFor":"approve Bash","cwd":"/tmp/project"}"#,
+        )
+        .expect("runtime hint");
+
+        assert!(matches!(hint.status, Some(AgentStatus::WaitingAttention)));
+        assert_eq!(
+            hint.last_output,
+            Some("Claude Code 等待处理：approve Bash".to_string())
+        );
+        assert_eq!(hint.cwd, Some("/tmp/project".to_string()));
+    }
+
+    #[test]
+    fn parses_vscode_remote_forward_port_from_log() {
+        let session = VscodeRemoteSession {
+            local_server_pid: 59914,
+            code_pid: Some(710),
+            endpoint: SshEndpoint {
+                host: "172.16.4.25-ct".to_string(),
+                user: None,
+                port: None,
+                password: None,
+            },
+            data_file_path: None,
+            socks_port: Some(61160),
+            remote_port: Some(50703),
+            exec_server_token: Some("token".to_string()),
+            local_forward_port: None,
+        };
+        let log = r#"
+[11:18:20.503] Starting forwarding server. local port 61233 -> socksPort 61160 -> remotePort 50703
+[11:18:20.504] Resolved "ssh-remote+172.16.4.25-ct" to "port 61233"
+"#;
+
+        assert_eq!(
+            parse_vscode_remote_forward_port_from_log(log, &session),
+            Some(61233)
+        );
+    }
+
+    #[test]
+    fn builds_stable_vscode_remote_fingerprint_without_local_server_pid() {
+        let endpoint = SshEndpoint {
+            host: "172.16.4.25-ct".to_string(),
+            user: None,
+            port: None,
+            password: None,
+        };
+
+        assert_eq!(
+            vscode_remote_fingerprint(&endpoint),
+            "vscode-remote-ssh:@172.16.4.25-ct:None"
+        );
+    }
+
+    #[test]
+    fn builds_vscode_remote_uri_for_remote_workspace() {
+        let endpoint = SshEndpoint {
+            host: "172.16.4.25".to_string(),
+            user: Some("root".to_string()),
+            port: Some(30291),
+            password: None,
+        };
+
+        assert_eq!(
+            vscode_remote_uri(&endpoint, Some("/root/my project")),
+            "vscode://vscode-remote/ssh-remote+root%40172.16.4.25/root/my%20project"
+        );
+    }
+
+    #[test]
+    fn builds_vscode_file_uri_for_local_workspace() {
+        assert_eq!(
+            vscode_file_uri(Some("/Users/van/My Project")),
+            Some("vscode://file/Users/van/My%20Project".to_string())
+        );
+    }
+
+    #[test]
+    fn matches_ghostty_ssh_tmux_title_with_quoted_remote_command() {
+        let terminal = GhosttyTerminal {
+            id: "terminal-id".to_string(),
+            name: r#"ssh -t root@172.16.4.25 -p 30291 "tmux attach-session -t codex""#.to_string(),
+            working_directory: "/Users/van".to_string(),
+        };
+
+        assert!(ghostty_terminal_matches(
+            &terminal,
+            Some("ssh -t root@172.16.4.25 -p 30291 tmux attach-session -t codex"),
+            None,
+            Some("codex")
+        ));
+    }
+
+    #[test]
+    fn extracts_tmux_session_from_ssh_process_command() {
+        assert_eq!(
+            tmux_session_from_process_command(
+                "ssh -t root@172.16.4.25 -p 30291 tmux attach-session -t codex"
+            ),
+            Some("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn builds_ghostty_focus_terms_from_ssh_tmux_command() {
+        assert_eq!(
+            ghostty_ssh_tmux_focus_terms(
+                "ssh -t root@172.16.4.25 -p 30291 tmux attach-session -t codex",
+                None
+            ),
+            Some(("172.16.4.25".to_string(), "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn matches_local_claude_ghostty_title_before_shared_cwd() {
+        let terminal = GhosttyTerminal {
+            id: "claude-terminal".to_string(),
+            name: "✳ Claude Code".to_string(),
+            working_directory: "/Users/van".to_string(),
+        };
+
+        assert!(ghostty_terminal_matches(
+            &terminal,
+            Some("claude"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn finds_saved_password_for_matching_remote_host() {
+        let hosts = vec![RemoteHost {
+            id: "server-main".to_string(),
+            label: "Linux Server".to_string(),
+            ssh_host: "172.16.4.25".to_string(),
+            ssh_user: "root".to_string(),
+            ssh_port: 30291,
+            ssh_password: Some("secret".to_string()),
+            scan_enabled: true,
+        }];
+
+        assert_eq!(
+            matching_remote_host_password(&hosts, Some("root"), "172.16.4.25", Some(30291)),
+            Some("secret".to_string())
+        );
     }
 }
 
