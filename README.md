@@ -1,6 +1,6 @@
 # Agent Pilot
 
-macOS-first AI Agent 管理悬浮窗第一版。
+AI Agent 管理悬浮窗第一版，目前支持MacOS。
 
 ## 当前实现
 
