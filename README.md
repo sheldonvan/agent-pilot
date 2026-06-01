@@ -2,6 +2,8 @@
 
 AI Agent 管理悬浮窗第一版，目前支持MacOS，支持本地终端、ghostty终端、ssh连接的服务器、tmux窗口等连接显示。若打开文件显示损坏，请打开终端输入xattr -dr com.apple.quarantine "/Applications/Agent Pilot.app"
 Agent太多且不清楚多agent状态，本工具可查看各agent运行情况，多颜色状态区分agent运行情况，直观不麻烦。dmg文件版本进入release可下载，喜欢的话点个星支持一下！
+<img width="430" height="650" alt="image" src="https://github.com/user-attachments/assets/9836db4d-d456-417d-b272-29ff3ae00aa7" />
+
 
 
 ## 当前实现
