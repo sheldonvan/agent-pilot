@@ -1,22 +1,52 @@
 # Agent Pilot
 
+语言：简体中文 | [English](README.en.md)
+
 多AI Agent 管理悬浮窗第一版，目前仅支持MacOS，支持本地终端、ghostty终端、ssh连接的服务器终端、tmux窗口等连接显示。若打开文件显示损坏，请打开终端输入xattr -dr com.apple.quarantine "/Applications/Agent Pilot.app"
+
 Agent太多且不清楚多agent状态？本工具可查看各agent运行情况，多颜色状态区分agent运行情况，直观不麻烦。dmg文件版本进入release可下载，喜欢的话点个星支持一下！
+
 <img width="430" height="650" alt="image" src="https://github.com/user-attachments/assets/9836db4d-d456-417d-b272-29ff3ae00aa7" />
 
+Agent Pilot 是一个 macOS-first 的 AI Agent 管理悬浮窗，用来集中观察、定位和管理本机或远程终端里的 Claude Code、Codex CLI 等 Agent 会话。
 
+> 当前版本：v0.2.0
+>
+> 下载：[Agent Pilot v0.2.0](https://github.com/sheldonvan/agent-pilot/releases/tag/v0.2.0)
 
 ## 当前实现
 
 - 列表式悬浮窗 UI：标题、统计、候选提示、Agent 卡片、底部状态栏。
-- Discovery：启动扫描、每分钟自动扫描、本地进程扫描、本地 tmux 扫描、已配置远程 SSH/tmux 扫描。
+- Discovery：启动扫描、自动扫描、本地进程扫描、本地 tmux 扫描、已配置远程 SSH/tmux 扫描。
 - VS Code Remote-SSH：自动发现 VS Code 的 Remote-SSH `localServer.js` 会话，解析 SSH alias，并在该 alias 支持非交互认证时扫描远端 `claude/codex` 进程与 tmux pane。
+- Ghostty / SSH：支持识别 Ghostty 中的本地 Agent、SSH Agent、SSH + tmux Agent，并尽量精确定位回对应终端。
 - Agent 列表：检测到的新终端会自动加入，关闭/消失的已发现终端会自动移除。
 - 候选 Agent：仅保留信息不完整、无法自动纳管的候选项，可确认添加或忽略。
 - 手动添加 Agent：本地/远程、Ghostty/Terminal/iTerm2、tmux session、SSH 字段。
 - 一键打开终端：本地 zsh + tmux，远程 SSH + tmux。
+- 状态判断：优先使用审批提示、Claude 运行时状态、Codex Desktop 日志、tmux pane 信息和终端输出变化，避免仅凭输入框可输入就误判为“等待输入”。
 - Collector API：`/api/events`、`/api/state`、`/api/discovery/*`、`/api/open-terminal`。
 - 配置文件：`~/.agent-pilot/config.json`。
+
+## 下载
+
+当前 release 提供 macOS Apple Silicon dmg：
+
+```text
+Agent.Pilot_0.2.0_aarch64.dmg
+```
+
+下载地址：
+
+```text
+https://github.com/sheldonvan/agent-pilot/releases/download/v0.2.0/Agent.Pilot_0.2.0_aarch64.dmg
+```
+
+SHA-256：
+
+```text
+86771867833e47e40dd71dbf47c0b9376648d430b4eada529b90a4752ca1e21f
+```
 
 ## 本地预览
 
@@ -30,11 +60,11 @@ python3 -m http.server 5174 -d web
 
 当前前端不需要 npm/pnpm/yarn。桌面壳需要 Tauri CLI 和较新的 Rust 工具链。
 
-本机验证时发现当前 `rustc 1.75.0` 无法编译 Tauri v2；请先升级到 `rustc 1.78+`，推荐直接安装当前 stable Rust，然后安装 Tauri CLI：
+推荐使用当前 stable Rust，然后安装 Tauri CLI：
 
 ```bash
 cargo install tauri-cli --version "^2"
-cargo tauri dev
+CARGO_TARGET_DIR=/private/tmp/agent-pilot-run-target cargo tauri dev
 ```
 
 启动后 Collector 会监听：
