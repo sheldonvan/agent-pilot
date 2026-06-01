@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 Sheldon Van */
+/* SPDX-License-Identifier: Apache-2.0 */
+
 :root {
   color-scheme: light;
   --ink: #1c1d22;
@@ -933,6 +936,10 @@ h2 {
   grid-template-columns: 1fr;
   padding-top: 0;
   border-top: 0;
+}
+
+.settings-section.legal-section {
+  grid-template-columns: 1fr;
 }
 
 .settings-section h3 {

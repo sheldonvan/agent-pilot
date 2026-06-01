@@ -13,6 +13,8 @@ Agent Pilot helps monitor, locate, and manage Claude Code, Codex CLI, and other 
 > Current version: v0.2.0
 >
 > Download: [Agent Pilot v0.2.0](https://github.com/sheldonvan/agent-pilot/releases/tag/v0.2.0)
+>
+> License: code is licensed under Apache-2.0; product name, icons, screenshots, release artwork, and other brand assets are reserved.
 
 ## What Works Today
 
@@ -109,3 +111,9 @@ You can also start any agent through the wrapper:
 ```bash
 PILOT_AGENT_KIND=codex PILOT_AGENT_NAME="Local Codex" scripts/agent-pilot local-codex codex
 ```
+
+## License and Copyright
+
+Code is licensed under the [Apache License 2.0](LICENSE) unless a file states otherwise. Copyright and attribution notices are in [NOTICE](NOTICE).
+
+The Agent Pilot name, branding, icons, screenshots, release artwork, and other visual brand assets are not licensed for reuse under the code license except as required for fair attribution or to describe the origin of the software.

@@ -2,7 +2,8 @@
 name = "agent-pilot"
 version = "0.2.0"
 description = "Agent Pilot"
-authors = ["Agent Pilot"]
+authors = ["Sheldon Van"]
+license = "Apache-2.0"
 edition = "2021"
 
 [build-dependencies]

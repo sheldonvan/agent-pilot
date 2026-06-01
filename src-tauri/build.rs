@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Sheldon Van
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{env, fs, path::PathBuf};
 
 fn main() {

@@ -1,0 +1,15 @@
+Agent Pilot
+Copyright 2026 Sheldon Van
+
+Agent Pilot is a macOS-first AI agent monitoring desktop app.
+
+The source code in this repository is licensed under the Apache License,
+Version 2.0, unless a file states otherwise.
+
+The name "Agent Pilot", project branding, icons, screenshots, release artwork,
+and other visual brand assets are not licensed for trademark or brand reuse
+except as required for fair attribution or to describe the origin of the
+software.
+
+This product includes third-party open source software. See package manifests,
+lockfiles, and dependency license metadata for details.

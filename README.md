@@ -13,6 +13,8 @@ Agent Pilot 是一个 macOS-first 的 AI Agent 管理悬浮窗，用来集中观
 > 当前版本：v0.2.0
 >
 > 下载：[Agent Pilot v0.2.0](https://github.com/sheldonvan/agent-pilot/releases/tag/v0.2.0)
+>
+> 许可证：代码采用 Apache-2.0；产品名称、图标、截图、发布视觉资产等品牌资产保留权利。
 
 ## 当前实现
 
@@ -109,3 +111,9 @@ scripts/codex-notify-example.sh
 ```bash
 PILOT_AGENT_KIND=codex PILOT_AGENT_NAME="Local Codex" scripts/agent-pilot local-codex codex
 ```
+
+## 许可证与版权
+
+代码默认采用 [Apache License 2.0](LICENSE)。版权与署名信息见 [NOTICE](NOTICE)。
+
+Agent Pilot 名称、品牌、图标、截图、release artwork 等视觉资产不随代码许可证授权复用，除非是合理署名或描述软件来源所必需。

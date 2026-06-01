@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Sheldon Van
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Sheldon Van
+// SPDX-License-Identifier: Apache-2.0
+
 const tauriInvoke = window.__TAURI__?.core?.invoke;
 const apiBase = "http://127.0.0.1:8787/api";
 const dragIgnoreSelector = "button,input,select,textarea,a,[role='button'],dialog";

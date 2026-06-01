@@ -1,5 +1,8 @@
 'use strict';
 
+// SPDX-FileCopyrightText: 2026 Sheldon Van
+// SPDX-License-Identifier: Apache-2.0
+
 const net = require('net');
 
 const NEED_MORE = Symbol('need_more');

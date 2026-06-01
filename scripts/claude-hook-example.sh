@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Sheldon Van
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 curl -sS -X POST "http://127.0.0.1:8787/api/events" \
