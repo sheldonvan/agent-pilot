@@ -5,8 +5,9 @@ use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -239,6 +240,14 @@ struct ScanResponse {
 struct AppStore {
     snapshot: Mutex<DeskSnapshot>,
     config: Mutex<DeskConfig>,
+    status_observations: Mutex<HashMap<String, StatusObservation>>,
+}
+
+#[derive(Debug, Clone)]
+struct StatusObservation {
+    output_hash: u64,
+    output_changed_at: u64,
+    last_seen_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +298,7 @@ const SCAN_DISCOVERY_SOURCES: [&str; 10] = [
 ];
 
 const APP_VERSION: &str = "0.2.0";
+const IDLE_PROMPT_STABLE_MS: u64 = 20_000;
 const VSCODE_REMOTE_EXEC_HELPER: &str = include_str!("../helpers/vscode_remote_exec.cjs");
 
 fn main() {
@@ -311,6 +321,7 @@ fn main() {
     let store = Arc::new(AppStore {
         snapshot: Mutex::new(snapshot),
         config: Mutex::new(config),
+        status_observations: Mutex::new(HashMap::new()),
     });
     let setup_store = store.clone();
 
@@ -705,7 +716,8 @@ fn run_scan(store: &Arc<AppStore>) -> ScanResponse {
         }
     }
 
-    let detected = dedup(detected);
+    let mut detected = dedup(detected);
+    apply_status_observations(store, &mut detected);
     let detected_count = detected.len();
     let detected_fingerprints: HashSet<String> = detected
         .iter()
@@ -785,6 +797,91 @@ fn active_ssh_session_endpoints(items: &[DiscoveredAgent]) -> Vec<SshEndpoint> {
         }
     }
     endpoints
+}
+
+fn apply_status_observations(store: &Arc<AppStore>, items: &mut [DiscoveredAgent]) {
+    let previous_statuses = store
+        .snapshot
+        .lock()
+        .map(|snapshot| {
+            let mut statuses = HashMap::new();
+            for agent in &snapshot.agents {
+                for fingerprint in agent_fingerprints(agent) {
+                    statuses.insert(fingerprint, agent.status.clone());
+                }
+            }
+            statuses
+        })
+        .unwrap_or_default();
+
+    let now = now_millis();
+    let mut current_output_keys = HashSet::new();
+    let Ok(mut observations) = store.status_observations.lock() else {
+        return;
+    };
+
+    for item in items {
+        let Some(output) = item.last_output.as_deref() else {
+            continue;
+        };
+        current_output_keys.insert(item.fingerprint.clone());
+
+        if matches!(
+            item.status,
+            Some(AgentStatus::WaitingAttention | AgentStatus::Error | AgentStatus::Offline)
+        ) {
+            continue;
+        }
+
+        let output_hash = stable_hash(output);
+        let observation =
+            observations
+                .entry(item.fingerprint.clone())
+                .or_insert(StatusObservation {
+                    output_hash,
+                    output_changed_at: now,
+                    last_seen_at: now,
+                });
+
+        let output_changed = observation.output_hash != output_hash;
+        if output_changed {
+            observation.output_hash = output_hash;
+            observation.output_changed_at = now;
+        }
+        observation.last_seen_at = now;
+
+        if matches!(item.status, Some(AgentStatus::Done)) && output_changed {
+            item.status = Some(AgentStatus::Running);
+            continue;
+        }
+
+        if item.status.is_some() {
+            continue;
+        }
+
+        if output_changed {
+            item.status = Some(AgentStatus::Running);
+            continue;
+        }
+
+        let stable_for = now.saturating_sub(observation.output_changed_at);
+        if contains_waiting_input_prompt(output) && stable_for >= IDLE_PROMPT_STABLE_MS {
+            item.status = Some(AgentStatus::Done);
+        } else if !matches!(
+            previous_statuses.get(&item.fingerprint),
+            Some(AgentStatus::WaitingAttention | AgentStatus::Error | AgentStatus::Offline)
+        ) {
+            item.status = Some(AgentStatus::Running);
+        }
+    }
+
+    observations.retain(|fingerprint, _| current_output_keys.contains(fingerprint));
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn confirm_candidate_inner(
@@ -1217,7 +1314,7 @@ fn scan_local_processes(remote_hosts: &[RemoteHost]) -> (Vec<DiscoveredAgent>, S
                 if runtime.status.is_some() {
                     status = runtime.status;
                 }
-                if runtime.last_output.is_some() {
+                if runtime.last_output.is_some() && last_output.is_none() {
                     last_output = runtime.last_output;
                 }
                 if runtime.cwd.is_some() {
@@ -2714,8 +2811,6 @@ fn infer_status_from_terminal_text(
     let recent_text = excerpt.as_deref().unwrap_or(text);
     let status = if contains_attention_prompt(recent_text) {
         Some(AgentStatus::WaitingAttention)
-    } else if contains_waiting_input_prompt(recent_text) {
-        Some(AgentStatus::Done)
     } else if current_command.map(is_idle_shell_command).unwrap_or(false) {
         Some(AgentStatus::Done)
     } else {
@@ -2772,36 +2867,9 @@ fn contains_waiting_input_prompt(text: &str) -> bool {
         if trimmed.is_empty() {
             return false;
         }
-        if trimmed == "›" || trimmed.starts_with("› ") {
-            return true;
-        }
-        if trimmed == "❯" || trimmed.ends_with(" ❯") {
-            return true;
-        }
         let lowered = trimmed.to_lowercase();
-        lowered.ends_with(" new task?")
-            || lowered.contains("new task? /")
-            || looks_like_shell_prompt(trimmed)
+        lowered.ends_with(" new task?") || lowered.contains("new task? /")
     })
-}
-
-fn looks_like_shell_prompt(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.len() > 120 || trimmed.contains('\t') {
-        return false;
-    }
-    let Some(last) = trimmed.chars().last() else {
-        return false;
-    };
-    if !matches!(last, '$' | '%' | '#') {
-        return false;
-    }
-    trimmed.contains('@')
-        || trimmed.contains('~')
-        || trimmed.contains('/')
-        || trimmed.starts_with('$')
-        || trimmed.starts_with('%')
-        || trimmed.starts_with('#')
 }
 
 fn is_idle_shell_command(command: &str) -> bool {
@@ -2861,7 +2929,9 @@ fn update_managed_from_candidate(agents: &mut [AgentItem], candidate: &Discovere
             .iter()
             .any(|item| item == &candidate.fingerprint)
         {
-            agent.status = candidate.status.clone().unwrap_or(AgentStatus::Running);
+            if let Some(status) = candidate.status.clone() {
+                agent.status = status;
+            }
             agent.updated_at = now_iso();
             agent.machine_label = candidate.machine_label.clone();
             if candidate.discovery_source == "vscode_remote_ssh" {
@@ -4720,13 +4790,29 @@ mod tests {
     }
 
     #[test]
-    fn maps_terminal_new_task_prompt_to_done() {
+    fn treats_terminal_new_task_prompt_as_weak_idle_marker() {
         let (status, _) = infer_status_from_terminal_text(
             "✔ Create run.py\n❯\n⏵⏵ accept edits on · new task? /clear to save",
             Some("claude"),
         );
 
-        assert!(matches!(status, Some(AgentStatus::Done)));
+        assert!(status.is_none());
+        assert!(contains_waiting_input_prompt(
+            "✔ Create run.py\n❯\n⏵⏵ accept edits on · new task? /clear to save"
+        ));
+    }
+
+    #[test]
+    fn bare_agent_input_prompt_is_not_idle_marker() {
+        let (status, _) = infer_status_from_terminal_text(
+            "Analyzing repository\n› Explain this codebase",
+            Some("codex"),
+        );
+
+        assert!(status.is_none());
+        assert!(!contains_waiting_input_prompt(
+            "Analyzing repository\n› Explain this codebase"
+        ));
     }
 
     #[test]
