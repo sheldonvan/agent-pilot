@@ -39,7 +39,10 @@
 
       <footer class="footer">
         <span id="lastUpdated">尚未同步</span>
-        <span class="footer-brand"><span class="dot online"></span>Pilot v0.2.0</span>
+        <div class="footer-meta">
+          <button class="footer-feedback" id="feedbackBtn" type="button">反馈</button>
+          <span class="footer-brand"><span class="dot online"></span>Pilot v0.2.0</span>
+        </div>
       </footer>
     </main>
 
@@ -261,6 +264,28 @@
             <p>Agent Pilot v0.2.0 · Copyright 2026 Sheldon Van · Code licensed under Apache-2.0. Brand assets reserved.</p>
           </div>
         </section>
+      </form>
+    </dialog>
+
+    <dialog id="feedbackDialog" class="dialog">
+      <form method="dialog" class="dialog-panel form-panel feedback-panel" id="feedbackForm">
+        <header>
+          <div>
+            <p class="eyebrow">Feedback</p>
+            <h2>意见反馈</h2>
+          </div>
+          <button class="icon-button" id="closeFeedbackBtn" type="button" aria-label="关闭">x</button>
+        </header>
+
+        <label>
+          反馈内容
+          <textarea name="message" rows="7" required placeholder="遇到的问题、期望的能力，或任何想告诉我的细节。"></textarea>
+        </label>
+
+        <menu>
+          <button class="primary" id="submitFeedbackBtn" value="default">提交</button>
+        </menu>
+        <p class="dialog-note form-status" id="feedbackStatus" role="status" aria-live="polite"></p>
       </form>
     </dialog>
 

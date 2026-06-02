@@ -7,6 +7,9 @@ const dragIgnoreSelector = "button,input,select,textarea,a,[role='button'],dialo
 const autoRefreshIntervalMs = 60_000;
 const themeStorageKey = "agentPilot.themeMode";
 const permissionGuideStorageKey = "agentPilot.permissionGuide.v1";
+const feedbackEmail = "fanfanofficial@icloud.com";
+const feedbackSubject = "agent-pilot意见反馈";
+const feedbackEndpoint = `https://formsubmit.co/ajax/${feedbackEmail}`;
 
 const els = {
   runningCount: document.querySelector("#runningCount"),
@@ -14,8 +17,13 @@ const els = {
   agentList: document.querySelector("#agentList"),
   lastUpdated: document.querySelector("#lastUpdated"),
   refreshBtn: document.querySelector("#refreshBtn"),
+  feedbackBtn: document.querySelector("#feedbackBtn"),
   settingsBtn: document.querySelector("#settingsBtn"),
   addBtn: document.querySelector("#addBtn"),
+  feedbackDialog: document.querySelector("#feedbackDialog"),
+  feedbackForm: document.querySelector("#feedbackForm"),
+  feedbackStatus: document.querySelector("#feedbackStatus"),
+  closeFeedbackBtn: document.querySelector("#closeFeedbackBtn"),
   settingsDialog: document.querySelector("#settingsDialog"),
   permissionDialog: document.querySelector("#permissionDialog"),
   permissionGuideBtn: document.querySelector("#permissionGuideBtn"),
@@ -671,6 +679,65 @@ function closePermissionGuide({ remember = true } = {}) {
   els.permissionDialog?.close();
 }
 
+function openFeedbackDialog() {
+  if (!els.feedbackDialog || !els.feedbackForm) return;
+  els.feedbackForm.reset();
+  setFeedbackStatus("");
+  els.feedbackDialog.showModal();
+  setTimeout(() => els.feedbackForm.elements.message?.focus(), 40);
+}
+
+function feedbackMetadata() {
+  return [
+    "---",
+    `Agent Pilot: v${state.version || "0.2.0"}`,
+    `时间: ${new Date().toLocaleString("zh-CN")}`,
+    `Agent 数量: ${state.agents?.length ?? 0}`,
+    `需关注: ${state.agents?.filter((agent) => agent.status === "waiting_attention").length ?? 0}`,
+    `系统: ${navigator.userAgent}`,
+  ].join("\n");
+}
+
+function setFeedbackStatus(message, tone = "") {
+  if (!els.feedbackStatus) return;
+  els.feedbackStatus.textContent = message;
+  els.feedbackStatus.dataset.tone = tone;
+}
+
+async function submitFeedback() {
+  const message = els.feedbackForm?.elements.message?.value?.trim();
+  if (!message) return;
+
+  const submitButton = els.feedbackForm.querySelector("#submitFeedbackBtn");
+  const body = [message, "", feedbackMetadata()].join("\n");
+
+  submitButton.disabled = true;
+  setFeedbackStatus("正在提交...", "pending");
+  try {
+    const response = await fetch(feedbackEndpoint, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Agent Pilot",
+        message: body,
+        _subject: feedbackSubject,
+        _captcha: "false",
+        _template: "table",
+      }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    setFeedbackStatus("已提交，感谢反馈。", "success");
+    setTimeout(() => els.feedbackDialog?.close(), 900);
+  } catch (error) {
+    setFeedbackStatus("提交失败，请检查网络后再试。", "error");
+  } finally {
+    submitButton.disabled = false;
+  }
+}
+
 async function openPermissionPane(pane) {
   await invoke("open_permission_settings", { pane });
 }
@@ -696,6 +763,8 @@ function escapeHtml(value = "") {
 }
 
 els.refreshBtn.addEventListener("click", refreshDiscovery);
+els.feedbackBtn?.addEventListener("click", openFeedbackDialog);
+els.closeFeedbackBtn?.addEventListener("click", () => els.feedbackDialog?.close());
 els.settingsBtn.addEventListener("click", () => els.settingsDialog.showModal());
 els.addBtn.addEventListener("click", () => els.manualDialog.showModal());
 els.closeManualBtn.addEventListener("click", () => els.manualDialog.close());
@@ -718,6 +787,10 @@ els.manualForm.addEventListener("submit", async (event) => {
   els.manualForm.reset();
   updateRemoteFields();
   await syncState();
+});
+els.feedbackForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitFeedback();
 });
 els.sshPasswordForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
